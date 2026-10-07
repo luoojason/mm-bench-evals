@@ -26,7 +26,7 @@ def main():
     ap.add_argument("--key-env", default="OPENROUTER_API_KEY")
     ap.add_argument("--reasoning-effort")
     ap.add_argument("--summary-tokens", type=int, default=32000)
-    ap.add_argument("--timeout", type=int, default=900)
+    ap.add_argument("--timeout", type=int, default=3600)
     ap.add_argument("--workers", type=int, default=3)
     a = ap.parse_args()
     a.max_tokens, a.extra, a.plain_content = 16000, None, False

@@ -85,6 +85,15 @@ python scripts/prefetch_summaries.py --model <same id> [--base-url ... --key-env
 
 It fills the same summaries folder from the other end of the book list.
 
+## Timing
+
+Most calls take seconds. The slow part is (b): each book's compaction summary takes
+~10-15 min on a frontier model at medium effort (~20k-token summaries; the subscription
+route cannot cap their length), and multi-book contexts take longer. The per-call limit
+(`--timeout`) defaults to 1 hour for this reason; at 15 min, two-book summaries failed.
+Expect roughly 9-10 hours per frontier model for the full set with `prefetch_summaries.py
+--workers 6` running alongside; the API routes are faster.
+
 ## Checking a pilot
 
 - Answers: `verify/evalsuite/<eval>/<model>/results.jsonl` (`EVALSUITE_OUT=<dir>` moves it).

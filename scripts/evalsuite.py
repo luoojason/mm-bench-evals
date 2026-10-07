@@ -614,14 +614,14 @@ def cmd_run(a, model=None):
         print(f"{ev} / {a.model}: {len(jobs)} jobs ({skipped} ineligible), "
               f"{len(done)} already done, {len(todo)} to run over "
               f"{len({j[1] for j in todo})} contexts; "
-              f"~{in_tok / 1e6:.1f}M input tokens before caching")
+              f"~{in_tok / 1e6:.1f}M input tokens before caching", flush=True)
     # One group per cached context, across evals; tools (no book in the prompt) last.
     groups = collections.OrderedDict()
     for ev, j in sorted(units, key=lambda u: (u[0] == "tools", u[1][1],
                                               FIRST.get(u[0], 9), u[1][0]["id"])):
         groups.setdefault(("tools", j[1]) if ev == "tools" else j[1], []).append((ev, j))
     if len(evs) > 1:
-        print(f"together: {len(units)} calls in {len(groups)} context groups")
+        print(f"together: {len(units)} calls in {len(groups)} context groups", flush=True)
     if a.dry_run or not units:
         return 0
     model = model or (GeminiCLI(a) if getattr(a, "backend", "openai") == "gemini-cli"
@@ -1002,7 +1002,9 @@ def main():
                    help="run only N halluc questions (the budget assumes 300)")
     p.add_argument("--plain-content", action="store_true",
                    help="send content as one string (for endpoints without content parts)")
-    p.add_argument("--timeout", type=int, default=900)
+    p.add_argument("--timeout", type=int, default=3600,
+                   help="seconds per call; a compaction summary of a multi-book context on a "
+                        "frontier model can take 20+ min (900 failed on GPT-6.1 Sol)")
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--ids"), p.add_argument("--types")
     p.add_argument("--reviewed-only", action="store_true",
