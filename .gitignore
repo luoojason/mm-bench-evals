@@ -1,0 +1,9 @@
+release/hf/data/
+verify/
+__pycache__/
+.venv*/
+tools-gemini-cli/node_modules/
+tools-gemini-cli/home/
+tools-gemini-cli/work/
+tools-gemini-cli/system.md
+tools-gemini-cli/package-lock.json

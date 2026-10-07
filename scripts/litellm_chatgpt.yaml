@@ -1,0 +1,54 @@
+# LiteLLM proxy: GPT models through a ChatGPT / Codex subscription instead of the
+# paid API, for scripts/evalsuite.py (Shivank's 2026-10-03 to-do; provider docs:
+# https://docs.litellm.ai/docs/providers/chatgpt).
+#
+# Setup, once (its own venv: the proxy pulls in many packages the bench does not need):
+#   python -m venv .venv-litellm
+#   .venv-litellm/Scripts/pip install "litellm[proxy]"        # tested with 1.103.2
+#
+# Start the proxy (git-bash; leave it running in its own terminal):
+#   export PYTHONUTF8=1 PYTHONIOENCODING=utf-8   # Windows: else the startup banner crashes it
+#   export CHATGPT_DEFAULT_INSTRUCTIONS="You are a careful reader answering questions about a text."
+#   .venv-litellm/Scripts/litellm --config scripts/litellm_chatgpt.yaml --port 4000
+#
+# Sign-in, first start only: startup STOPS at "Waiting for application startup" until
+# you sign in (it looks hung; it is not). A minute or so later the terminal prints
+# "Visit https://auth.openai.com/codex/device / Enter code: XXXX-XXXXX". Open it, sign
+# in with the ChatGPT account whose subscription should pay, enter the code; startup
+# then finishes. The token is saved to ~/.config/litellm/chatgpt/auth.json
+# (CHATGPT_TOKEN_DIR moves it) and reused on later starts.
+# Check it is up:  curl localhost:4000/v1/models
+#
+# Then run the evals against it (no API key: the proxy holds the login):
+#   .venv/Scripts/python scripts/evalsuite.py run --eval all \
+#       --model chatgpt/gpt-6.1-sol --base-url http://localhost:4000/v1 --key-env "" \
+#       --reasoning-effort medium --halluc-sample 300 --limit 5
+#
+# Things to know:
+# - The backend sends every request with a system "instructions" string. LiteLLM's
+#   default is the Codex coding-agent prompt; the export above replaces it with a
+#   neutral one so the persona is not part of what we measure. If the backend
+#   rejects the neutral one, unset the variable and note that in the results.
+# - The backend rejects output-token limits, so LiteLLM strips --max-tokens and
+#   --summary-tokens: the model decides its own length. Compaction summaries are
+#   therefore uncapped on this route.
+# - Subscription usage has weekly limits, not a bill. A stopped run resumes
+#   (`run` skips finished questions), so hitting the limit costs nothing but time.
+# - LiteLLM 1.103.2's price table lists models up to gpt-5.6; newer names pass
+#   through to the backend. If a name is refused, check the model picker in the
+#   Codex app for the exact id.
+
+model_list:
+  - model_name: chatgpt/gpt-6.1-sol
+    model_info:
+      mode: responses
+    litellm_params:
+      model: chatgpt/gpt-6.1-sol
+  - model_name: chatgpt/gpt-6-luna
+    model_info:
+      mode: responses
+    litellm_params:
+      model: chatgpt/gpt-6-luna
+
+litellm_settings:
+  drop_params: true   # e.g. the cache_control marker on the book block
