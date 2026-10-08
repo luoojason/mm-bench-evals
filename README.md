@@ -83,7 +83,8 @@ python scripts/prefetch_summaries.py --model <same id> [--base-url ... --key-env
     --reasoning-effort medium --workers 3
 ```
 
-It fills the same summaries folder from the other end of the book list.
+It fills the same summaries folder from the other end of the book list. A second copy
+with `--start middle` works forward from the midpoint, doubling the rate.
 
 ## Timing
 
@@ -91,8 +92,9 @@ Most calls take seconds. The slow part is (b): each book's compaction summary ta
 ~10-15 min on a frontier model at medium effort (~20k-token summaries; the subscription
 route cannot cap their length), and multi-book contexts take longer. The per-call limit
 (`--timeout`) defaults to 1 hour for this reason; at 15 min, two-book summaries failed.
-Expect roughly 9-10 hours per frontier model for the full set with `prefetch_summaries.py
---workers 6` running alongside; the API routes are faster.
+`run` works on up to `--workers` books at once (each book's first call still goes alone,
+to write the cache). On the subscription route the usage limit, not the script, is
+usually what sets the pace.
 
 ## Checking a pilot
 

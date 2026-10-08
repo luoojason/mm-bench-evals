@@ -28,11 +28,17 @@ def main():
     ap.add_argument("--summary-tokens", type=int, default=32000)
     ap.add_argument("--timeout", type=int, default=3600)
     ap.add_argument("--workers", type=int, default=3)
+    ap.add_argument("--start", choices=["end", "middle"], default="end",
+                    help="end: walk back from the last context; middle: walk forward from the "
+                         "midpoint, for a second prefetch alongside the first")
     a = ap.parse_args()
     a.max_tokens, a.extra, a.plain_content = 16000, None, False
 
     qs, stories = es.load_data()
     keys = sorted({es.ctx_key(q["story_ids"]) for q in qs}, reverse=True)
+    if a.start == "middle":
+        keys = keys[::-1]
+        keys = keys[len(keys) // 2:] + keys[:len(keys) // 2]
     outdir = es.OUT / "compact" / es.slug(a.model) / "summaries"
     outdir.mkdir(parents=True, exist_ok=True)
     todo = [k for k in keys if not (outdir / f"{k}.json").exists()]

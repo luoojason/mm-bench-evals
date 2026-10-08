@@ -361,14 +361,20 @@ class GeminiCLI:
 class Fake:
     """Scripted model for `selftest`. `fn(messages, tools)` returns a reply dict."""
 
-    def __init__(self, fn):
-        self.fn, self.calls = fn, []
+    def __init__(self, fn, delay=0.0):
+        self.fn, self.calls, self.delay = fn, [], delay
+        self.spans = []  # [start, end] per call, same order as calls
         self.lock = threading.Lock()
 
     def chat(self, messages, tools=None, max_tokens=None):
         with self.lock:
             self.calls.append(messages)
-        return self.fn(messages, tools)
+            i = len(self.calls) - 1
+            self.spans.append([time.perf_counter(), None])
+        time.sleep(self.delay)
+        out = self.fn(messages, tools)
+        self.spans[i][1] = time.perf_counter()
+        return out
 
 
 # ---- the four evals ---------------------------------------------------------
@@ -653,18 +659,35 @@ def cmd_run(a, model=None):
                 fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
             stats[rec["status"]] += 1
             n = sum(stats.values())
-            if n % 10 == 0 or n == len(units) or rec["status"] != "ok":
+            if n % 10 == 0 or n <= 5 or n == len(units) or rec["status"] != "ok":
                 tag = rec.get("error", "")[:120]
                 print(f"  [{n}/{len(units)}] {ev} {q['id']} {rec['status']} {tag}",
                       flush=True)
 
+    # Up to --workers contexts at once, and up to --workers calls in total within them.
+    # Within a context the first call still runs alone (it writes the cache) and the
+    # rest follow it. Running contexts one at a time instead left the run serial on
+    # small groups and stalled it behind one slow multi-book summary.
+    calls = threading.BoundedSemaphore(a.workers)
+
+    def gated(unit):
+        with calls:
+            one(unit)
+
+    def group(us):
+        gated(us[0])
+        with cf.ThreadPoolExecutor(max_workers=a.workers) as inner:
+            list(inner.map(gated, us[1:]))
+
     with cf.ThreadPoolExecutor(max_workers=a.workers) as pool:
+        futs = []
         for key, us in groups.items():
-            if isinstance(key, tuple):  # tools: nothing cached, all at once
-                list(pool.map(one, us))
-                continue
-            one(us[0])  # first call on a context alone: it writes the cache
-            list(pool.map(one, us[1:]))
+            if isinstance(key, tuple):  # tools: nothing cached, each call on its own
+                futs += [pool.submit(gated, u) for u in us]
+            else:
+                futs.append(pool.submit(group, us))
+        for f in futs:
+            f.result()
     print(f"done: {dict(stats)} -> " + ", ".join(str(st[ev]["res"]) for ev in evs))
     return 0 if not stats["error"] else 2
 
@@ -914,7 +937,7 @@ def cmd_selftest(a):
     check(m.calls[-1][-1]["content"].startswith("Tool budget used up"),
           "the last call tells the model to answer")
 
-    print("--eval all: every eval in one pass, each book's calls back to back")
+    print("--eval all: every eval in one pass; each book's first call runs before the rest")
     OUT = tmp / "together"
     # Add questions ON the books the picked questions use as distractors, so some
     # book is both a zeroshot context and a halluc distractor in this run.
@@ -926,28 +949,36 @@ def cmd_selftest(a):
     golds = {q["story_ids"][0] for q in sel_all if len(q["story_ids"]) == 1}
     both = golds & set(pick_distractors(sel_all, stories, 0).values())
     ids = ",".join(pick + extra)
-    m = Fake(oracle)
+    m = Fake(oracle, delay=0.02)  # long enough for calls to overlap
     cmd_run(args("all", ids=ids), model=m)
     counts = {ev: len(results(ev)) for ev in EVALS}
     check(counts["zeroshot"] == counts["compact"] == counts["tools"] == len(pick) + len(extra)
           and counts["halluc"] > 0, f"one results file per eval: {counts}")
     check(not any(r["status"] != "ok" for ev in EVALS for r in results(ev)),
           "all ok")
-    seq = []  # (call index, book text) for calls that carry a book in context
+    by_book = collections.defaultdict(list)  # book text -> call indexes carrying it
     for i, c in enumerate(m.calls):
         cont = c[0]["content"]
         if isinstance(cont, list) and not cont[0]["text"].startswith("SUMMARY"):
-            seq.append((i, cont[0]["text"]))
-    runs = [t for k, (_, t) in enumerate(seq) if k == 0 or seq[k - 1][1] != t]
-    check(len(runs) == len(set(runs)),
-          f"{len(set(runs))} book contexts, each in one unbroken run of calls")
+            by_book[cont[0]["text"]].append(i)
+
+    def first_alone(idx):
+        first = min(idx, key=lambda i: m.spans[i][0])
+        return all(m.spans[first][1] <= m.spans[i][0] for i in idx if i != first)
+    check(by_book and all(first_alone(v) for v in by_book.values()),
+          f"{len(by_book)} book contexts, each written to cache by a first call that "
+          "finished before any other call on it started")
     halluc_books = {r["context"] for r in results("halluc")}
-    shared = [b for b in both if b in halluc_books and stories[b]["text"] in runs]
-    check(len(shared) > 0, f"{len(shared)} books are both a zeroshot context and a "
-          "halluc distractor, and each sits in a single run (cache written once)")
-    last_book = max(i for i, _ in seq)
-    tool_calls = [i for i, c in enumerate(m.calls) if c[0]["role"] == "system"]
-    check(tool_calls and min(tool_calls) > last_book, "tools calls run after every book")
+    shared = [b for b in both if b in halluc_books and stories[b]["text"] in by_book]
+    check(len(shared) > 0 and all(first_alone(by_book[stories[b]["text"]]) for b in shared),
+          f"{len(shared)} books are both a zeroshot context and a halluc distractor, "
+          "and share one first call (cache written once)")
+    firsts = [min(v, key=lambda i: m.spans[i][0]) for v in by_book.values()]
+    check(any(m.spans[i][0] < m.spans[j][1] and m.spans[j][0] < m.spans[i][1]
+              for i in firsts for j in firsts if i != j), "different books run at the same time")
+    tool_calls = [c for c in m.calls if c[0]["role"] == "system"]
+    check(tool_calls and all(not isinstance(c[1]["content"], list) for c in tool_calls),
+          "tools calls carry no book block")
     n_sum = sum(1 for c in m.calls if isinstance(c[0]["content"], list)
                 and COMPACT_REQUEST in c[0]["content"][1]["text"])
     check(n_sum == len({r["context"] for r in results("compact")}),
