@@ -7,8 +7,8 @@ counted but never scored), and writes:
     <out>/compiled.csv   one row per model x eval x subset x question type
     <out>/compiled.md    the overall table plus a per-type table per eval
 
-Accuracy = CORRECT / scored (ABSTAINED / scored for halluc). "verified" is the subset
-whose second human check is done (board_status != Awaiting verification); report both.
+Accuracy = CORRECT / scored (ABSTAINED / scored for halluc). Every question counts as
+verified: the team's second check is complete (2026-10-08), so there is no subset split.
 
     python scripts/compile_results.py [--out verify/evalsuite]
 """
@@ -39,11 +39,9 @@ def main():
             recs = [json.loads(l) for l in io.open(res, encoding="utf-8")]
             scored = es.score_rows(ev, by_id, recs)
             good = "ABSTAINED" if ev == "halluc" else "CORRECT"
-            for subset in ("all", "verified"):
+            for subset in ("all",):
                 cells = collections.defaultdict(collections.Counter)
                 for q, _, v, _ in scored:
-                    if subset == "verified" and q["board_status"] == "Awaiting verification":
-                        continue
                     cells["ALL"][v] += 1
                     cells[q["question_type"]][v] += 1
                 for t, c in sorted(cells.items()):
@@ -71,7 +69,7 @@ def main():
     models = sorted({m for m, _, _ in overall})
     md = ["# Compiled results", "",
           "Accuracy on scored answers (n, errors). halluc = abstained when the book is absent.", ""]
-    for subset in ("all", "verified"):
+    for subset in ("all",):
         md += [f"## {subset} questions", "", "| model | " + " | ".join(es.EVALS) + " |",
                "|" + " --- |" * (len(es.EVALS) + 1)]
         for m in models:
@@ -88,7 +86,7 @@ def main():
             md.append(f"| {m} | " + " | ".join(pct(cell.get(t)) for t in types) + " |")
         md.append("")
     io.open(out / "compiled.md", "w", encoding="utf-8", newline="\n").write("\n".join(md))
-    print("\n".join(md[:md.index("## verified questions")]))
+    print("\n".join(md[:md.index("## all questions") + len(models) + 4]))
     print(f"-> {out / 'compiled.csv'}, {out / 'compiled.md'}")
     return 0
 

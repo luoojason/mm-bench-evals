@@ -113,9 +113,8 @@ python scripts/compile_results.py                                # everything, o
 ```
 
 `compile_results.py` writes `compiled.md` and `compiled.csv`: accuracy per model x eval x
-question type, for all questions and for the **verified** subset (second human check done;
-1,013 questions are still awaiting it). Halluc accuracy = share abstained. ERROR rows are
-counted but not scored; UNCLEAR verdicts are scored and listed.
+question type over all questions (every question is verified). Halluc accuracy = share
+abstained. ERROR rows are counted but not scored; UNCLEAR verdicts are scored and listed.
 
 ## Files
 
