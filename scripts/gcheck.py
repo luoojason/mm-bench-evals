@@ -73,16 +73,37 @@ def norm(s):
     return re.sub(r"\s+", " ", s).strip()
 
 
-NUMWORD = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
-           "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
-           "twelve": 12, "fifteen": 15, "twenty": 20, "thirty": 30,
-           "forty": 40, "fifty": 50, "sixty": 60, "hundred": 100,
-           "thousand": 1000}
+UNITS = {w: i for i, w in enumerate(
+    "zero one two three four five six seven eight nine ten eleven twelve "
+    "thirteen fourteen fifteen sixteen seventeen eighteen nineteen".split())}
+TENS = {w: 10 * i for i, w in enumerate(
+    "_ _ twenty thirty forty fifty sixty seventy eighty ninety".split()) if i > 1}
+SCALES = {"hundred": 100, "thousand": 1000, "million": 1000000}
 
 
 def numbers_in(s):
     out = {int(m.replace(",", "")) for m in re.findall(r"\d[\d,]*", str(s))}
-    out |= {NUMWORD[w] for w in norm(s).split() if w in NUMWORD}
+    # A run of number words is ONE number: "twenty-five" is 25 and "four hundred"
+    # is 400. Reading each word alone made the gold "Twenty-five dollars" {5, 20},
+    # so a correct "$25" scored WRONG (gemini-3.8-flash pilot, mcmp-1127).
+    total = cur = 0
+    run = False
+    for w in norm(s).split() + [""]:
+        if w in UNITS or w in TENS:
+            cur += UNITS.get(w, TENS.get(w))
+        elif w in SCALES:
+            cur = max(cur, 1) * SCALES[w]
+            if SCALES[w] >= 1000:
+                total, cur = total + cur, 0
+        elif w == "and" and run:
+            continue
+        else:
+            if run:
+                out.add(total + cur)
+            total = cur = 0
+            run = False
+            continue
+        run = True
     return out
 
 
@@ -358,6 +379,11 @@ def cmd_selftest(a):
         ("Chicago", "UNKNOWN", "UNKNOWN"), ("Chicago", "", "UNCLEAR"),
         ("1200", "about 1,200 pounds", "CORRECT"),
         ("four hundred feet or more", "four hundred feet or more", "CORRECT"),
+        # compound number words are one number, not their parts
+        ("Twenty-five dollars", "$25", "CORRECT"),
+        ("Twenty-five dollars", "twenty-five", "CORRECT"),
+        ("25", "twenty", "WRONG"),
+        ("1250", "one thousand two hundred and fifty", "CORRECT"),
     ]
     ok = fail = 0
     for gold, resp, want in cases:
