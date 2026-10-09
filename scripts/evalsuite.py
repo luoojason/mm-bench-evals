@@ -70,7 +70,7 @@ import pyarrow.parquet as pq
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
-from gcheck import adjudicate, norm  # noqa: E402  the project's one scorer
+from gcheck import adjudicate, norm, numbers_in  # noqa: E402  the project's one scorer
 
 DATA = ROOT / "release" / "hf" / "data"
 OUT = Path(os.environ.get("EVALSUITE_OUT") or ROOT / "verify" / "evalsuite")  # pilots set it
@@ -699,12 +699,82 @@ def first_answer_line(resp):
     return m.group(1).strip() if m else (resp or "").strip()
 
 
+def parts_of(q):
+    """The sub-answers of a multi-part (composition) question, or None. Only when
+    the gold itself is a labelled list: a computation question also carries
+    components, but they combine into ONE answer ("120 men")."""
+    if not split_parts(q.get("expected_output") or "", 2):
+        return None
+    try:
+        comps = json.loads(q.get("components") or "[]")
+    except ValueError:
+        return None
+    subs = [c.get("sub_answer") for c in comps if isinstance(c, dict)]
+    return subs if len(subs) >= 2 and all(subs) else None
+
+
+def split_parts(text, n):
+    """Cut a reply labelled (a) ... (b) ... into n pieces, or None unless every
+    label is there, in order."""
+    pos, cuts = 0, []
+    for L in "abcdefgh"[:n]:
+        m = re.compile(r"(?:^|(?<=[\s;,.:*]))\(?\s*" + L + r"\s*\)", re.I).search(text, pos)
+        if not m:
+            return None
+        cuts.append((m.start(), m.end()))
+        pos = m.end()
+    return [text[e:(cuts[i + 1][0] if i + 1 < n else len(text))].strip(" ;,.\n*")
+            for i, (_, e) in enumerate(cuts)]
+
+
+def part_verdict(gold, part):
+    """One sub-answer. A part is one short item of a list, so every number in it
+    belongs to the answer; the whole-reply scorer's guard against incidental
+    numbers in reasoning (which needs ONE number up front) does not apply."""
+    gn = numbers_in(gold)
+    if not gn or len(part) > 200:
+        return adjudicate(gold, part)[0]
+    if re.match(r"^\W*unknown\W*$", norm(part)):
+        return "UNKNOWN"
+    stated = numbers_in(part)
+    if gn <= stated:
+        return "CORRECT"
+    return "UNCLEAR" if gn & stated else "WRONG"
+
+
 def verdict(ev, q, rec):
     if ev == "halluc":
         v, _ = adjudicate("__never__", first_answer_line(rec["response"]))
         return ("ABSTAINED" if v == "UNKNOWN" else "ANSWERED"), ""
     if rec.get("finish") == "turn_cap":
         return "WRONG", "turn cap reached without an answer"
+    subs = parts_of(q)
+    if subs:
+        # Multi-part questions are scored part by part against their own
+        # sub-answers, and every part must be right. Scoring the whole list
+        # against the whole gold left ~16% of ALL answers UNCLEAR: a numeric gold
+        # needs one stated number up front, and "(a) 1903; (b) 100 miles an hour;
+        # (c) ..." never has one (GPT-6.1 Sol / GPT-6 Luna runs, 2026-10-08).
+        resp = rec["response"] or ""
+        pieces = split_parts(first_answer_line(resp), len(subs))
+        if pieces is None:
+            m = re.search(r"answer\s*\**\s*[:\-]", resp, re.I)
+            pieces = split_parts(resp[m.end():] if m else resp, len(subs))
+        if pieces is None:  # unlabelled "35; UNKNOWN": take it only if the count fits
+            semi = [p.strip() for p in first_answer_line(resp).split(";")]
+            pieces = semi if len(semi) == len(subs) and all(semi) else None
+        if pieces is not None:
+            vs = [part_verdict(g, p) for g, p in zip(subs, pieces)]
+            ok = vs.count("CORRECT")
+            mark = {"CORRECT": "ok", "WRONG": "wrong", "UNKNOWN": "unknown", "UNCLEAR": "unsure"}
+            tag = f"parts {ok}/{len(vs)} correct ({', '.join(mark[v] for v in vs)})"
+            if ok == len(vs):
+                return "CORRECT", tag
+            if vs.count("UNKNOWN") == len(vs):
+                return "UNKNOWN", tag
+            if "WRONG" in vs or "UNKNOWN" in vs:
+                return "WRONG", tag
+            return "UNCLEAR", tag
     return adjudicate(q["expected_output"], first_answer_line(rec["response"]))
 
 
@@ -788,6 +858,21 @@ def cmd_selftest(a):
         print(("  ok   " if cond else "  FAIL ") + msg)
         if not cond:
             fails.append(msg)
+
+    print("multi-part scoring")
+    mq = {"expected_output": "(a) Fifteen; (b) three-and-twenty miles",
+          "components": json.dumps([{"sub_answer": "Fifteen"},
+                                    {"sub_answer": "three-and-twenty miles"}])}
+    for resp, want in [("ANSWER: (a) 15; (b) 23 miles", "CORRECT"),
+                       ("ANSWER: (a) fifteen pupils (b) three and twenty", "CORRECT"),
+                       ("ANSWER: 15; 23", "CORRECT"),
+                       ("ANSWER: (a) 15; (b) UNKNOWN", "WRONG"),
+                       ("ANSWER: (a) 15; (b) 3", "WRONG"),
+                       ("ANSWER: UNKNOWN", "UNKNOWN")]:
+        got = verdict("zeroshot", mq, {"response": resp})[0]
+        check(got == want, f"{resp!r} -> {got} (want {want})")
+    check(parts_of({"expected_output": "120 men", "components": mq["components"]}) is None,
+          "a single-answer gold is not split even when it has components")
 
     def q_of(messages):
         text = "".join(p["text"] if isinstance(p, dict) else p
