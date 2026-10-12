@@ -54,6 +54,7 @@ import argparse
 import collections
 import concurrent.futures as cf
 import functools
+import hashlib
 import io
 import json
 import os
@@ -373,14 +374,22 @@ class Antigravity:
     part's growth in input tokens is checked against its length, so a cut part is
     an error, never a wrong answer.
 
+    Each part turn is a full model request that re-reads the conversation so far,
+    so sending the parts again for every question cost ~4 requests per question and
+    used up the plan's 5-hour quota after ~150 questions. Instead the parts go in
+    once per context into a conversation that is kept, and each question runs in a
+    copy of it (`_fork`, resumed with --conversation): one request per question.
+    When the quota runs out, all workers wait for the reset and carry on.
+
     Differences from the API route: agy's agent system prompt (~13k tokens) stays in
     place and its tools are listed; the prompt says not to use them and any tool
     step is counted in usage.cli_tool_calls. No function calling for us, so no tools
-    eval. Conversation files are deleted after each call (a book is up to 3 MB)."""
+    eval. Conversation files are deleted when done with (a book is up to 3 MB)."""
 
     DIR = ROOT / "tools-antigravity"
     CHUNK_CHARS = 80_000
-    STEPS = {"user_input", "agent_response", "checkpoint"}
+    MAX_PRIMES = 12  # kept context conversations; contexts run a few at a time
+    STEPS = {"user_input", "agent_response", "checkpoint", "system_message"}
 
     def __init__(self, a):
         # --model agy/gemini-3.8-flash-medium: the prefix keeps results apart from
@@ -390,6 +399,9 @@ class Antigravity:
         self.work = self.DIR / "work"
         self.work.mkdir(parents=True, exist_ok=True)
         self.store = Path.home() / ".gemini" / "antigravity-cli"
+        self.primes = collections.OrderedDict()  # context hash -> (id, input tokens)
+        self.plock, self.klocks = threading.Lock(), {}
+        self.gate, self.quota_until = threading.Lock(), 0.0
 
     def _purge(self, cid):
         if not cid or not re.fullmatch(r"[0-9a-f-]{36}", cid):
@@ -438,25 +450,28 @@ class Antigravity:
         return out + ["That was the whole text. Work from it alone, without tools."
                       + SEP + tail]
 
-    def chat(self, messages, tools=None, max_tokens=None):
+    def _run(self, turns, conversation=None, keep=False):
+        """One agy process over stream-json; returns (results, step counts). Waits
+        out the plan's quota window instead of failing, so a long run paces itself."""
         import subprocess
-        if tools:
-            raise CallError("antigravity route has no function calling (tools eval)")
-        turns = self.turns(messages)
         stdin = "".join(json.dumps({"event": "user", "message": {"content": t}},
                                    ensure_ascii=False) + "\n" for t in turns)
         cmd = [self.exe, "--model", self.model, "--input-format", "stream-json",
                "--output-format", "stream-json", "--disable-slash-commands",
                "--sandbox", "-p="]
-        last = None
-        for attempt in range(4):
+        if conversation:
+            cmd[1:1] = ["--conversation", conversation]
+        last, attempt = None, 0
+        while attempt < 4:
+            with self.gate:  # held while the quota is out
+                pass
             try:
                 p = subprocess.run(cmd, input=stdin.encode("utf-8"), cwd=self.work,
                                    capture_output=True, timeout=self.timeout, shell=False)
             except subprocess.TimeoutExpired:
-                last = f"agy timed out after {self.timeout}s"
+                last, attempt = f"agy timed out after {self.timeout}s", attempt + 1
                 continue
-            results, steps, cid = [], collections.Counter(), None
+            results, steps = [], collections.Counter()
             for line in p.stdout.decode("utf-8", "replace").splitlines():
                 try:
                     ev = json.loads(line)
@@ -464,39 +479,120 @@ class Antigravity:
                     continue
                 if ev.get("event") == "result":
                     results.append(ev["result"])
-                    cid = cid or ev["result"].get("conversation_id")
                 elif ev.get("event") == "step_update":
                     steps[ev["step_update"].get("step_type")] += 1
-            self._purge(cid)
             bad = [r for r in results if r.get("status") != "SUCCESS"]
-            if len(results) == len(turns) and not bad:
-                prev = 0
-                for i, (t, r) in enumerate(zip(turns, results)):
-                    now = (r.get("usage") or {}).get("input_tokens", 0)
-                    if i < len(turns) - 1 and len(turns) > 1 and now - prev < len(t) / 8:
-                        # deterministic, so not retried: the same text is cut again
-                        raise CallError(f"part {i + 1} of {len(turns) - 1} added only "
-                                        f"{now - prev} input tokens for {len(t)} chars "
-                                        "(message cut by agy)")
-                    prev = now
-                u = results[-1].get("usage") or {}
-                return {"content": results[-1].get("response") or "", "tool_calls": [],
-                        "finish": "stop",
-                        "usage": {"prompt_tokens": u.get("input_tokens", 0),
-                                  "completion_tokens": u.get("output_tokens", 0),
-                                  "thinking_tokens": u.get("thinking_tokens", 0),
-                                  "cached_tokens": u.get("cache_read_tokens", 0),
-                                  "turns": len(turns),
-                                  "cli_tool_calls": sum(v for k, v in steps.items()
-                                                        if k not in self.STEPS)}}
+            ok = len(results) == len(turns) and not bad
+            if not conversation and not (ok and keep):
+                self._purge(next((r.get("conversation_id") for r in results), None))
+            if ok:
+                return results, steps
             err = (bad[0].get("error") if bad else None) or \
                 p.stderr.decode("utf-8", "replace")[-300:] or \
                 f"{len(results)} results for {len(turns)} turns"
             last = f"agy (exit {p.returncode}): {str(err)[:400]}"
-            if any(w in last.lower() for w in ("log in", "login", "authentication")):
-                break  # not transient: sign in first
-            time.sleep(2 ** attempt * 30)
+            if any(w in last.lower() for w in ("log in", "login", "authentication",
+                                               "trajectory not found")):
+                break  # not transient
+            m = re.search(r"quota reached.*?resets in\s*(?:(\d+)h)?\s*(?:(\d+)m)?",
+                          last, re.I | re.S)
+            if m:  # wait for the window, then retry without spending an attempt
+                wait = int(m.group(1) or 0) * 3600 + int(m.group(2) or 0) * 60 + 120
+                with self.gate:
+                    if time.time() >= self.quota_until:
+                        self.quota_until = time.time() + wait
+                        print(f"  agy quota reached at {time.strftime('%H:%M')}; "
+                              f"waiting {wait // 60} min", flush=True)
+                    while time.time() < self.quota_until:
+                        time.sleep(30)
+                continue
+            attempt += 1
+            time.sleep(2 ** attempt * 15)
         raise CallError(last)
+
+    def _prime(self, parts):
+        """The context as part turns in a conversation that is kept, once per context.
+        Returns (conversation id, its cumulative usage)."""
+        key = hashlib.sha1("\x00".join(parts).encode("utf-8")).hexdigest()
+        with self.plock:
+            lock = self.klocks.setdefault(key, threading.Lock())
+        with lock:
+            if key in self.primes:
+                return self.primes[key]
+            results, _ = self._run(parts, keep=True)
+            cid, prev = results[0].get("conversation_id"), 0
+            for i, (t, r) in enumerate(zip(parts, results)):
+                now = (r.get("usage") or {}).get("input_tokens", 0)
+                if now - prev < len(t) / 8:
+                    self._purge(cid)
+                    # deterministic, so not retried: the same text is cut again
+                    raise CallError(f"part {i + 1} of {len(parts)} added only "
+                                    f"{now - prev} input tokens for {len(t)} chars "
+                                    "(message cut by agy)")
+                prev = now
+            with self.plock:
+                self.primes[key] = (cid, results[-1].get("usage") or {})
+                while len(self.primes) > self.MAX_PRIMES:  # oldest context is done
+                    self._purge(self.primes.popitem(last=False)[1][0])
+            return self.primes[key]
+
+    def _fork(self, cid):
+        """A copy of a kept conversation under a new id, to resume with --conversation.
+        agy finds a conversation by trajectory_meta.cascade_id; the copy's other
+        references to the old id are inert (tested 2026-10-12)."""
+        import sqlite3
+        import uuid
+        new = str(uuid.uuid4())
+        src = sqlite3.connect(self.store / "conversations" / f"{cid}.db")
+        dst = sqlite3.connect(self.store / "conversations" / f"{new}.db")
+        try:
+            src.backup(dst)
+            dst.execute("update trajectory_meta set cascade_id=?, trajectory_id=?",
+                        (new, str(uuid.uuid4())))
+            dst.commit()
+        finally:
+            src.close()
+            dst.close()
+        return new
+
+    def close(self):
+        with self.plock:
+            while self.primes:
+                self._purge(self.primes.popitem()[1][0])
+
+    def chat(self, messages, tools=None, max_tokens=None):
+        if tools:
+            raise CallError("antigravity route has no function calling (tools eval)")
+        turns = self.turns(messages)
+        parts, ask = turns[:-1], turns[-1]
+        pu = {}
+        if parts:
+            cid, pu = self._prime(parts)
+            fork = self._fork(cid)
+            try:
+                results, steps = self._run([ask], conversation=fork)
+            finally:
+                self._purge(fork)
+        else:
+            results, steps = self._run([ask])
+        # agy's usage is cumulative over a conversation (cache reads apart from
+        # input_tokens) and does not add up per request, so the deltas below are
+        # approximate. The fork's context is checked by its turn count instead.
+        n = results[-1].get("num_turns", 0)
+        if parts and n != len(turns):
+            raise CallError(f"forked request saw {n} turns, expected {len(turns)}")
+        u = {k: v - pu.get(k, 0) for k, v in (results[-1].get("usage") or {}).items()
+             if isinstance(v, int)}
+        read = u.get("input_tokens", 0) + u.get("cache_read_tokens", 0)
+        return {"content": results[-1].get("response") or "", "tool_calls": [],
+                "finish": "stop",
+                "usage": {"prompt_tokens": read,
+                          "completion_tokens": u.get("output_tokens", 0),
+                          "thinking_tokens": u.get("thinking_tokens", 0),
+                          "cached_tokens": u.get("cache_read_tokens", 0),
+                          "context_parts": len(parts),
+                          "cli_tool_calls": sum(v for k, v in steps.items()
+                                                if k not in self.STEPS)}}
 
 
 class Fake:
@@ -830,6 +926,8 @@ def cmd_run(a, model=None):
                 futs.append(pool.submit(group, us))
         for f in futs:
             f.result()
+    if hasattr(model, "close"):
+        model.close()
     print(f"done: {dict(stats)} -> " + ", ".join(str(st[ev]["res"]) for ev in evs))
     return 0 if not stats["error"] else 2
 
