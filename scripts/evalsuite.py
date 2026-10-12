@@ -358,6 +358,147 @@ class GeminiCLI:
         raise CallError(last)
 
 
+class Antigravity:
+    """Gemini through Google's Antigravity CLI (`agy`) signed in with a Google
+    account, so calls draw on that account's plan instead of an API key. Gemini CLI
+    sign-in stopped working for individual plans by 2026-10-11 ("migrate to the
+    Antigravity suite"); this is the replacement route.
+
+    agy silently cuts any one message to roughly 33k tokens, so a book cannot go in
+    one message (the median book is ~103k). Instead the context goes in as several
+    user turns of at most CHUNK_CHARS each ("part i of n, reply only OK"), then the
+    request as the last turn, all in one print-mode conversation over stream-json
+    stdin. Tested 2026-10-12 with three needles at 5/50/97% of a ~140k-token text:
+    sent this way all three were found; sent as one message, only the first. Each
+    part's growth in input tokens is checked against its length, so a cut part is
+    an error, never a wrong answer.
+
+    Differences from the API route: agy's agent system prompt (~13k tokens) stays in
+    place and its tools are listed; the prompt says not to use them and any tool
+    step is counted in usage.cli_tool_calls. No function calling for us, so no tools
+    eval. Conversation files are deleted after each call (a book is up to 3 MB)."""
+
+    DIR = ROOT / "tools-antigravity"
+    CHUNK_CHARS = 80_000
+    STEPS = {"user_input", "agent_response", "checkpoint"}
+
+    def __init__(self, a):
+        # --model agy/gemini-3.8-flash-medium: the prefix keeps results apart from
+        # the gemini-cli route's; agy itself takes the bare id (`agy models`)
+        self.model, self.timeout = a.model.removeprefix("agy/"), a.timeout
+        self.exe = getattr(a, "agy", None) or shutil.which("agy") or "agy"
+        self.work = self.DIR / "work"
+        self.work.mkdir(parents=True, exist_ok=True)
+        self.store = Path.home() / ".gemini" / "antigravity-cli"
+
+    def _purge(self, cid):
+        if not cid or not re.fullmatch(r"[0-9a-f-]{36}", cid):
+            return
+        for f in (self.store / "conversations" / f"{cid}.db",
+                  self.store / "annotations" / f"{cid}.pbtxt"):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+
+    @classmethod
+    def turns(cls, messages):
+        """User turns: the context block in parts, then everything else as the request."""
+        ctx, rest = "", []
+        for m in messages:
+            c = m.get("content")
+            if isinstance(c, list):
+                if not ctx and len(c) > 1:
+                    ctx, c = c[0]["text"], c[1:]
+                rest.append("\n\n".join(p["text"] for p in c))
+            else:
+                rest.append(c)
+        tail = "\n\n".join(rest).strip()
+        if not ctx:
+            return [tail]
+        parts, cur = [], ""
+        for para in ctx.split("\n\n"):
+            while len(para) > cls.CHUNK_CHARS:  # one huge paragraph: hard split
+                if cur:
+                    parts.append(cur)
+                    cur = ""
+                parts.append(para[:cls.CHUNK_CHARS])
+                para = para[cls.CHUNK_CHARS:]
+            if cur and len(cur) + 2 + len(para) > cls.CHUNK_CHARS:
+                parts.append(cur)
+                cur = para
+            else:
+                cur = cur + "\n\n" + para if cur else para
+        if cur:
+            parts.append(cur)
+        n = len(parts)
+        out = [f"I will send a long text in {n} parts, then a request about it. Do not "
+               f"use any tools. After each part reply only: OK.\n\nPart {i + 1} of {n}:"
+               f"\n<part>\n{t}\n</part>" for i, t in enumerate(parts)]
+        return out + ["That was the whole text. Work from it alone, without tools."
+                      + SEP + tail]
+
+    def chat(self, messages, tools=None, max_tokens=None):
+        import subprocess
+        if tools:
+            raise CallError("antigravity route has no function calling (tools eval)")
+        turns = self.turns(messages)
+        stdin = "".join(json.dumps({"event": "user", "message": {"content": t}},
+                                   ensure_ascii=False) + "\n" for t in turns)
+        cmd = [self.exe, "--model", self.model, "--input-format", "stream-json",
+               "--output-format", "stream-json", "--disable-slash-commands",
+               "--sandbox", "-p="]
+        last = None
+        for attempt in range(4):
+            try:
+                p = subprocess.run(cmd, input=stdin.encode("utf-8"), cwd=self.work,
+                                   capture_output=True, timeout=self.timeout, shell=False)
+            except subprocess.TimeoutExpired:
+                last = f"agy timed out after {self.timeout}s"
+                continue
+            results, steps, cid = [], collections.Counter(), None
+            for line in p.stdout.decode("utf-8", "replace").splitlines():
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if ev.get("event") == "result":
+                    results.append(ev["result"])
+                    cid = cid or ev["result"].get("conversation_id")
+                elif ev.get("event") == "step_update":
+                    steps[ev["step_update"].get("step_type")] += 1
+            self._purge(cid)
+            bad = [r for r in results if r.get("status") != "SUCCESS"]
+            if len(results) == len(turns) and not bad:
+                prev = 0
+                for i, (t, r) in enumerate(zip(turns, results)):
+                    now = (r.get("usage") or {}).get("input_tokens", 0)
+                    if i < len(turns) - 1 and len(turns) > 1 and now - prev < len(t) / 8:
+                        # deterministic, so not retried: the same text is cut again
+                        raise CallError(f"part {i + 1} of {len(turns) - 1} added only "
+                                        f"{now - prev} input tokens for {len(t)} chars "
+                                        "(message cut by agy)")
+                    prev = now
+                u = results[-1].get("usage") or {}
+                return {"content": results[-1].get("response") or "", "tool_calls": [],
+                        "finish": "stop",
+                        "usage": {"prompt_tokens": u.get("input_tokens", 0),
+                                  "completion_tokens": u.get("output_tokens", 0),
+                                  "thinking_tokens": u.get("thinking_tokens", 0),
+                                  "cached_tokens": u.get("cache_read_tokens", 0),
+                                  "turns": len(turns),
+                                  "cli_tool_calls": sum(v for k, v in steps.items()
+                                                        if k not in self.STEPS)}}
+            err = (bad[0].get("error") if bad else None) or \
+                p.stderr.decode("utf-8", "replace")[-300:] or \
+                f"{len(results)} results for {len(turns)} turns"
+            last = f"agy (exit {p.returncode}): {str(err)[:400]}"
+            if any(w in last.lower() for w in ("log in", "login", "authentication")):
+                break  # not transient: sign in first
+            time.sleep(2 ** attempt * 30)
+        raise CallError(last)
+
+
 class Fake:
     """Scripted model for `selftest`. `fn(messages, tools)` returns a reply dict."""
 
@@ -596,8 +737,8 @@ def cmd_run(a, model=None):
     qs, stories = load_data()
     qs = select(qs, a)
     evs = parse_evals(a.eval)
-    if getattr(a, "backend", "openai") == "gemini-cli" and "tools" in evs:
-        print("gemini-cli route: skipping tools (needs function calling; run it on the API)")
+    if getattr(a, "backend", "openai") in ("gemini-cli", "antigravity") and "tools" in evs:
+        print(f"{a.backend} route: skipping tools (needs function calling; run it on the API)")
         evs = [e for e in evs if e != "tools"]
     st, units = {}, []
     for ev in evs:
@@ -630,8 +771,9 @@ def cmd_run(a, model=None):
         print(f"together: {len(units)} calls in {len(groups)} context groups", flush=True)
     if a.dry_run or not units:
         return 0
-    model = model or (GeminiCLI(a) if getattr(a, "backend", "openai") == "gemini-cli"
-                      else OpenAICompat(a))
+    backend = getattr(a, "backend", "openai")
+    model = model or (GeminiCLI(a) if backend == "gemini-cli" else
+                      Antigravity(a) if backend == "antigravity" else OpenAICompat(a))
     wlock = threading.Lock()
     stats = collections.Counter()
 
@@ -1097,9 +1239,12 @@ def main():
     p.add_argument("--eval", required=True,
                    help=f"one of {', '.join(EVALS)}; a comma list; or all (run per novel)")
     p.add_argument("--model", required=True, help="model id as the endpoint names it")
-    p.add_argument("--backend", choices=("openai", "gemini-cli"), default="openai",
-                   help="openai: any OpenAI-compatible endpoint; gemini-cli: Gemini through "
-                        "the signed-in Gemini CLI (Google plan, no API key)")
+    p.add_argument("--backend", choices=("openai", "gemini-cli", "antigravity"),
+                   default="openai",
+                   help="openai: any OpenAI-compatible endpoint; gemini-cli / antigravity: "
+                        "Gemini through the signed-in Gemini CLI or Antigravity CLI "
+                        "(Google plan, no API key)")
+    p.add_argument("--agy", help="path to the agy executable (default: on PATH)")
     p.add_argument("--gemini", help="path to the gemini executable "
                                     "(default: tools-gemini-cli/node_modules/.bin)")
     p.add_argument("--base-url", default="https://openrouter.ai/api/v1")
