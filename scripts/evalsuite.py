@@ -388,6 +388,7 @@ class Antigravity:
 
     DIR = ROOT / "tools-antigravity"
     CHUNK_CHARS = 80_000
+    QUOTA_POLL = 20 * 60  # seconds between tries while the plan's quota is out
     MAX_PRIMES = 12  # kept context conversations; contexts run a few at a time
     STEPS = {"user_input", "agent_response", "checkpoint", "system_message"}
 
@@ -499,7 +500,12 @@ class Antigravity:
             m = re.search(r"quota reached.*?resets in\s*(?:(\d+)h)?\s*(?:(\d+)m)?",
                           last, re.I | re.S)
             if m:  # wait for the window, then retry without spending an attempt
-                wait = int(m.group(1) or 0) * 3600 + int(m.group(2) or 0) * 60 + 120
+                # The stated reset is not when a long request fits again: after
+                # waiting it out, the first ~100k-token request was refused again
+                # with a fresh ~4h wait while a short one passed (2026-10-13). The
+                # budget frees up gradually, so poll instead of trusting it.
+                wait = min(int(m.group(1) or 0) * 3600 + int(m.group(2) or 0) * 60 + 120,
+                           self.QUOTA_POLL)
                 with self.gate:
                     if time.time() >= self.quota_until:
                         self.quota_until = time.time() + wait
