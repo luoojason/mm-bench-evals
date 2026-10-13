@@ -982,10 +982,22 @@ def part_verdict(gold, part):
     return "UNCLEAR" if gn & stated else "WRONG"
 
 
+def all_unknown(line):
+    """True when every part of a (labelled or semicolon-separated) reply is
+    UNKNOWN, e.g. "(a) UNKNOWN; (b) UNKNOWN". A multi-part question asked of the
+    wrong book is abstained on part by part; scoring only the whole line as one
+    answer counted those as ANSWERED (35 of 35 composition replies per model,
+    GPT-6.1 Sol / GPT-6 Luna halluc runs, found 2026-10-12)."""
+    bare = re.sub(r"(?:^|(?<=[\s;,.:*]))\(?\s*[a-h]\s*\)", ";", line or "", flags=re.I)
+    bits = [b for b in re.split(r"[;,]", bare) if norm(b)]
+    return bool(bits) and all(re.match(r"^\W*unknown\W*$", norm(b)) for b in bits)
+
+
 def verdict(ev, q, rec):
     if ev == "halluc":
-        v, _ = adjudicate("__never__", first_answer_line(rec["response"]))
-        return ("ABSTAINED" if v == "UNKNOWN" else "ANSWERED"), ""
+        line = first_answer_line(rec["response"])
+        v, _ = adjudicate("__never__", line)
+        return ("ABSTAINED" if v == "UNKNOWN" or all_unknown(line) else "ANSWERED"), ""
     if rec.get("finish") == "turn_cap":
         return "WRONG", "turn cap reached without an answer"
     subs = parts_of(q)
