@@ -407,6 +407,8 @@ class Antigravity:
         if not cid or not re.fullmatch(r"[0-9a-f-]{36}", cid):
             return
         for f in (self.store / "conversations" / f"{cid}.db",
+                  self.store / "conversations" / f"{cid}.db-wal",
+                  self.store / "conversations" / f"{cid}.db-shm",
                   self.store / "annotations" / f"{cid}.pbtxt"):
             try:
                 f.unlink()
@@ -520,14 +522,19 @@ class Antigravity:
             if key in self.primes:
                 return self.primes[key]
             results, _ = self._run(parts, keep=True)
-            cid, prev = results[0].get("conversation_id"), 0
+            # A part (<= CHUNK_CHARS, ~20k tokens) is under agy's ~33k-token cut, so
+            # this is a backstop for a part that went missing. agy's cumulative
+            # usage is noisy (a part of 80k chars once showed +4k input tokens and
+            # +18k on a rerun of the same text), hence the loose bound.
+            cid, prev = results[0].get("conversation_id"), (0, 0)
             for i, (t, r) in enumerate(zip(parts, results)):
-                now = (r.get("usage") or {}).get("input_tokens", 0)
-                if now - prev < len(t) / 8:
+                u = r.get("usage") or {}
+                now = (u.get("input_tokens", 0), u.get("cache_read_tokens", 0))
+                grow = max(now[0] - prev[0], sum(now) - sum(prev))
+                if grow < len(t) / 40:
                     self._purge(cid)
-                    # deterministic, so not retried: the same text is cut again
                     raise CallError(f"part {i + 1} of {len(parts)} added only "
-                                    f"{now - prev} input tokens for {len(t)} chars "
+                                    f"{grow} tokens for {len(t)} chars "
                                     "(message cut by agy)")
                 prev = now
             with self.plock:
