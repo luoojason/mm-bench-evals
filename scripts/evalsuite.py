@@ -45,6 +45,10 @@ in tools-gemini-cli/ and signed in once (release/GEMINI_ROUTE.md; class GeminiCL
 has the caveats; no tools eval on this route):
     --backend gemini-cli --model gemini-3.8-flash-medium --workers 2
 
+Claude through a Claude plan: `claude -p` with every tool off (class ClaudeCLI;
+never a proxy in front of the subscription; no tools eval on this route):
+    --backend claude-cli --model haiku --workers 2
+
 Nothing here spends money unless `run` is pointed at a paid endpoint. `--dry-run`
 prints what would be sent (calls, contexts, input tokens) and stops.
 """
@@ -355,6 +359,113 @@ class GeminiCLI:
             last = f"gemini-cli (exit {p.returncode}): {str(err)[:400]}"
             if "auth" in last.lower() or "login" in last.lower():
                 break  # not transient: sign in first
+            time.sleep(2 ** attempt * 10)
+        raise CallError(last)
+
+
+class ClaudeCLI:
+    """Claude through `claude -p` signed in with a Claude plan, so calls draw on
+    that plan instead of an API key. Not a proxy in front of the subscription
+    (Shivank, 2026-10-17: a LiteLLM proxy risks the account), just the CLI.
+
+    Every tool is off (--tools ""), skills off, no MCP servers, no user settings or
+    hooks, and a neutral system prompt replaces the coding-agent one, so the model
+    answers from the prompt alone; a reply that took more than one turn (a tool
+    ran) is an error, not an answer. The book (the cache_control block) rides in
+    the system prompt and the question on stdin, so the CLI's own prompt caching
+    reuses the book across a context's questions.
+    Runs from an empty work dir so no CLAUDE.md is picked up. --model takes a CLI
+    alias or full id (haiku, sonnet, claude-haiku-5-5). No function calling, so no
+    tools eval. API-key variables are dropped from the environment so a call can
+    never bill an API key."""
+
+    DIR = ROOT / "tools-claude-cli"
+    SYSTEM = GeminiCLI.SYSTEM
+
+    def __init__(self, a):
+        self.model, self.timeout = a.model, a.timeout
+        self.exe = a.claude or shutil.which("claude") or "claude"
+        self.work = self.DIR / "work"
+        self.work.mkdir(parents=True, exist_ok=True)
+        self.mcp = self.DIR / "empty-mcp.json"
+        io.open(self.mcp, "w", encoding="utf-8", newline="\n").write('{"mcpServers":{}}')
+        self.effort = getattr(a, "reasoning_effort", None)
+        self.env = dict(os.environ, NO_COLOR="1")
+        for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK",
+                  "CLAUDE_CODE_USE_VERTEX"):
+            self.env.pop(k, None)
+
+    def chat(self, messages, tools=None, max_tokens=None):
+        import subprocess
+        if tools:
+            raise CallError("claude-cli route has no function calling (tools eval)")
+        # The cached block (the book, or a compaction summary) goes in the system
+        # prompt, which the CLI caches on its own; the rest goes on stdin. Sent as
+        # one user message the book was re-written to the cache on every question
+        # (smoke test 2026-10-17: 0 cache reads over 3 questions on one book).
+        cached, parts = [], []
+        for m in messages:
+            c = m.get("content")
+            if isinstance(c, list):
+                cached += [p["text"] for p in c if p.get("cache_control")]
+                parts.append("".join(p["text"] for p in c if not p.get("cache_control")))
+            else:
+                parts.append(c)
+        system = self.SYSTEM + "".join("\n\n" + t for t in cached)
+        fd, sysfile = tempfile.mkstemp(suffix=".txt", dir=self.work)
+        with io.open(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(system)
+        cmd = [self.exe, "-p", "--model", self.model, "--tools", "",
+               "--disable-slash-commands", "--strict-mcp-config",
+               "--mcp-config", str(self.mcp), "--setting-sources", "project",
+               "--no-session-persistence", "--no-chrome", "--output-format", "json",
+               "--system-prompt-file", sysfile]
+        if self.effort and self.effort != "minimal":
+            cmd += ["--effort", self.effort]
+        try:
+            return self._call(cmd, "\n\n".join(parts).lstrip())
+        finally:
+            os.unlink(sysfile)
+
+    def _call(self, cmd, stdin):
+        import subprocess
+        last = None
+        for attempt in range(3):
+            try:
+                p = subprocess.run(cmd, input=stdin.encode("utf-8"),
+                                   cwd=self.work, env=self.env, capture_output=True,
+                                   timeout=self.timeout, shell=False)
+            except subprocess.TimeoutExpired:
+                last = f"claude-cli timed out after {self.timeout}s"
+                continue
+            out = p.stdout.decode("utf-8", "replace")
+            j = None
+            try:
+                j = json.loads(out[out.index("{"):])
+            except ValueError:
+                pass
+            if j and not j.get("is_error") and j.get("result") is not None:
+                if (j.get("num_turns") or 1) > 1:
+                    raise CallError(f"claude-cli took {j['num_turns']} turns (a tool ran?)")
+                u = j.get("usage") or {}
+                cr = u.get("cache_read_input_tokens", 0)
+                cw = u.get("cache_creation_input_tokens", 0)
+                return {"content": j["result"], "tool_calls": [],
+                        "finish": j.get("stop_reason") or "stop",
+                        "usage": {"prompt_tokens": u.get("input_tokens", 0) + cr + cw,
+                                  "completion_tokens": u.get("output_tokens", 0),
+                                  "thinking_tokens": (u.get("output_tokens_details") or {})
+                                  .get("thinking_tokens", 0),
+                                  "cached_tokens": cr, "cache_write_tokens": cw,
+                                  "models": list(j.get("modelUsage") or {})}}
+            err = (j or {}).get("result") or (j or {}).get("error") or out[-300:] \
+                or p.stderr.decode("utf-8", "replace")[-300:]
+            last = f"claude-cli (exit {p.returncode}): {str(err)[:400]}"
+            low = last.lower()
+            if "login" in low or "auth" in low:
+                break  # not transient: sign in first
+            if "limit" in low and ("usage" in low or "reset" in low):
+                break  # plan limit: stop here and resume later with --retry-errors
             time.sleep(2 ** attempt * 10)
         raise CallError(last)
 
@@ -846,7 +957,8 @@ def cmd_run(a, model=None):
     qs, stories = load_data()
     qs = select(qs, a)
     evs = parse_evals(a.eval)
-    if getattr(a, "backend", "openai") in ("gemini-cli", "antigravity") and "tools" in evs:
+    if getattr(a, "backend", "openai") in ("gemini-cli", "antigravity", "claude-cli") \
+            and "tools" in evs:
         print(f"{a.backend} route: skipping tools (needs function calling; run it on the API)")
         evs = [e for e in evs if e != "tools"]
     st, units = {}, []
@@ -882,7 +994,8 @@ def cmd_run(a, model=None):
         return 0
     backend = getattr(a, "backend", "openai")
     model = model or (GeminiCLI(a) if backend == "gemini-cli" else
-                      Antigravity(a) if backend == "antigravity" else OpenAICompat(a))
+                      Antigravity(a) if backend == "antigravity" else
+                      ClaudeCLI(a) if backend == "claude-cli" else OpenAICompat(a))
     wlock = threading.Lock()
     stats = collections.Counter()
 
@@ -1362,11 +1475,13 @@ def main():
     p.add_argument("--eval", required=True,
                    help=f"one of {', '.join(EVALS)}; a comma list; or all (run per novel)")
     p.add_argument("--model", required=True, help="model id as the endpoint names it")
-    p.add_argument("--backend", choices=("openai", "gemini-cli", "antigravity"),
+    p.add_argument("--backend", choices=("openai", "gemini-cli", "antigravity", "claude-cli"),
                    default="openai",
                    help="openai: any OpenAI-compatible endpoint; gemini-cli / antigravity: "
                         "Gemini through the signed-in Gemini CLI or Antigravity CLI "
-                        "(Google plan, no API key)")
+                        "(Google plan, no API key); claude-cli: Claude through `claude -p` "
+                        "on a Claude plan, every tool off")
+    p.add_argument("--claude", help="path to the claude executable (default: on PATH)")
     p.add_argument("--agy", help="path to the agy executable (default: on PATH)")
     p.add_argument("--gemini", help="path to the gemini executable "
                                     "(default: tools-gemini-cli/node_modules/.bin)")
