@@ -514,6 +514,7 @@ class Antigravity:
         self.primes = collections.OrderedDict()  # context hash -> (id, input tokens)
         self.plock, self.klocks = threading.Lock(), {}
         self.gate, self.quota_until = threading.Lock(), 0.0
+        self.quota_exit = getattr(a, "quota_exit", False)
 
     def _purge(self, cid):
         if not cid or not re.fullmatch(r"[0-9a-f-]{36}", cid):
@@ -610,6 +611,11 @@ class Antigravity:
                 break  # not transient
             m = re.search(r"quota reached.*?resets in\s*(?:(\d+)h)?\s*(?:(\d+)m)?",
                           last, re.I | re.S)
+            if m and self.quota_exit:  # a scheduled rerun takes the next window
+                print(f"  agy quota reached at {time.strftime('%H:%M')}; exiting "
+                      "(--quota-exit)", flush=True)
+                time.sleep(5)  # let other workers finish their result writes
+                os._exit(75)
             if m:  # wait for the window, then retry without spending an attempt
                 # The stated reset is not when a long request fits again: after
                 # waiting it out, the first ~100k-token request was refused again
@@ -1513,6 +1519,8 @@ def main():
     p.add_argument("--sample", type=int), p.add_argument("--seed", type=int, default=0)
     p.add_argument("--limit", type=int)
     p.add_argument("--retry-errors", action="store_true")
+    p.add_argument("--quota-exit", action="store_true",
+                   help="antigravity: exit when the quota runs out instead of waiting")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(func=cmd_run)
     p = sub.add_parser("score")
