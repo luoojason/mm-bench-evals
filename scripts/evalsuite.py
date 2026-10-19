@@ -202,6 +202,33 @@ class CallError(Exception):
     pass
 
 
+_served = threading.local()
+
+
+def note_served(backend, info):
+    """What the endpoint says actually answered (model id, request id), kept per
+    thread so cmd_run can attach every call of a question to its record. The
+    requested model name alone does not identify a snapshot (audit #13)."""
+    calls = getattr(_served, "calls", None)
+    if calls is not None:
+        calls.append({k: v for k, v in info.items() if v})
+
+
+def provenance(a):
+    """Run-level identity written into every record: code and data hashes and the
+    settings that shaped generation. A selection seed is not a generation seed,
+    so sampling settings are recorded as sent (unset = the endpoint's default)."""
+    def h(p):
+        return hashlib.sha256(Path(p).read_bytes()).hexdigest()[:16] if Path(p).exists() else None
+    return {"code": {n: h(ROOT / "scripts" / n) for n in ("evalsuite.py", "gcheck.py")},
+            "data": {n: h(DATA / n) for n in ("questions.parquet", "stories.parquet")},
+            "backend": getattr(a, "backend", "openai"),
+            "settings": {k: getattr(a, k, None) for k in
+                         ("max_tokens", "summary_tokens", "max_turns", "reasoning_effort",
+                          "extra", "plain_content", "timeout")},
+            "sampling": "endpoint default unless set in settings.extra"}
+
+
 class OpenAICompat:
     """POST /chat/completions on any OpenAI-compatible endpoint."""
 
@@ -255,6 +282,8 @@ class OpenAICompat:
                         last = f"no choices: {str(j)[:300]}"
                     else:
                         msg = j["choices"][0]["message"]
+                        note_served(self, {"model": j.get("model"), "request_id": j.get("id"),
+                                           "system_fingerprint": j.get("system_fingerprint")})
                         return {"content": msg.get("content") or "",
                                 "tool_calls": msg.get("tool_calls") or [],
                                 "finish": j["choices"][0].get("finish_reason"),
@@ -447,6 +476,8 @@ class ClaudeCLI:
             if j and not j.get("is_error") and j.get("result") is not None:
                 if (j.get("num_turns") or 1) > 1:
                     raise CallError(f"claude-cli took {j['num_turns']} turns (a tool ran?)")
+                note_served(self, {"model": list(j.get("modelUsage") or {}),
+                                   "request_id": j.get("session_id") or j.get("uuid")})
                 u = j.get("usage") or {}
                 cr = u.get("cache_read_input_tokens", 0)
                 cw = u.get("cache_creation_input_tokens", 0)
@@ -979,7 +1010,8 @@ def cmd_run(a, model=None):
         if res.exists():
             for line in io.open(res, encoding="utf-8"):
                 r = json.loads(line)
-                if r["status"] == "ok" or not a.retry_errors:
+                ok = r["status"] == "ok" and (r.get("response") or "").strip()
+                if ok or not a.retry_errors:
                     done.add(r["id"])
         todo = [j for j in jobs if j[0]["id"] not in done]
         st[ev] = {"env": env, "res": res}
@@ -1004,26 +1036,33 @@ def cmd_run(a, model=None):
                       ClaudeCLI(a) if backend == "claude-cli" else OpenAICompat(a))
     wlock = threading.Lock()
     stats = collections.Counter()
+    prov = provenance(a)
 
     def one(unit):
         ev, (q, key, _) = unit
         env, res = st[ev]["env"], st[ev]["res"]
         ctx = env["context"](key)
         t0 = time.time()
+        _served.calls = []
         try:
             out = RUNNERS[ev](q, ctx, model, env)
-            if not (out["response"] or "").strip() and out.get("finish") == "length":
-                # A thinking model that spends the whole budget reasoning returns
-                # nothing. That is a budget setting, not a wrong answer (seen on
-                # the first real run, DeepSeek V4.1 Flash at 4,000 tokens).
-                raise CallError("no answer within --max-tokens (reasoning used "
-                                "the budget); raise --max-tokens and --retry-errors")
+            if not (out["response"] or "").strip():
+                # No answer is infrastructure, not a wrong answer: the paper's
+                # policy is retry (--retry-errors) and exclude. A thinking model
+                # that spends the whole budget reasoning returns nothing (DeepSeek
+                # V4.1 Flash at 4,000 tokens); two Luna tools replies came back
+                # empty with finish=stop and were scored wrong (audit #17).
+                raise CallError("empty response" + (
+                    " (reasoning used the budget; raise --max-tokens)"
+                    if out.get("finish") == "length" else "") + "; rerun with --retry-errors")
             rec = {"id": q["id"], "status": "ok", **out}
         except Exception as e:  # recorded as infrastructure, never as an answer
             rec = {"id": q["id"], "status": "error",
                    "error": f"{type(e).__name__}: {str(e)[:500]}"}
         rec.update(eval=ev, model=a.model, context=key,
-                   seconds=round(time.time() - t0, 1))
+                   seconds=round(time.time() - t0, 1),
+                   started=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t0)),
+                   served=_served.calls, provenance=prov)
         with wlock:
             with io.open(res, "a", encoding="utf-8", newline="\n") as fh:
                 fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -1172,6 +1211,11 @@ def score_rows(ev, qs_by_id, results):
         if rec["status"] != "ok":
             rows.append((q, rec, "ERROR", rec.get("error", "")))
             continue
+        if not (rec.get("response") or "").strip():
+            # Saved before empty replies became errors (audit #17): excluded like
+            # any failed call, and picked up again by --retry-errors.
+            rows.append((q, rec, "ERROR", "empty response"))
+            continue
         v, why = verdict(ev, q, rec)
         rows.append((q, rec, v, why))
     return rows
@@ -1184,13 +1228,14 @@ def cmd_score(a):
     rows = score_rows(a.eval, by_id, [json.loads(l) for l in io.open(res, encoding="utf-8")])
     mech = {q["id"]: v for q, _, v, _ in rows}
     if getattr(a, "judged", False):
+        judge_args(a)
         jd = load_judged(a.eval, a.model)
         unjudged = 0
         for i, (q, rec, v, why) in enumerate(rows):
             j = jd.get(q["id"])
             if v == "ERROR" or a.eval == "halluc":
                 continue
-            if j and j["reply"] == reply_key(rec.get("response")):
+            if j and j.get("key") == judge_key(judge_prompt(q, rec.get("response")), a):
                 rows[i] = (q, rec, j["verdict"], "judge: " + j["why"])
             else:
                 unjudged += 1
@@ -1299,18 +1344,58 @@ class JudgeCLI(ClaudeCLI):
     SYSTEM = JUDGE_SYSTEM
 
 
-def judged_path(ev, model):
-    return OUT / ev / slug(model) / "judged.jsonl"
+# Bump when JUDGE_SYSTEM, JUDGE_PROMPT or the reply rendering changes meaning;
+# every cached verdict is tied to it through judge_key().
+JUDGE_VERSION = "2026-10-18.1"
+
+# A variant reruns the judge on the same items to measure its own reliability:
+# "rep" asks again unchanged (repeat agreement), "swap" shows the candidate
+# before the reference (order sensitivity). Their verdicts never enter scores.
+VARIANTS = ("rep", "swap")
+
+
+def render_reply(response):
+    """The whole reply; only a pathological one is cut, keeping its head and its
+    end (where an answer is committed). Saved replies so far are at most ~700
+    characters, so nothing real is cut; the old last-6,000-characters cut could
+    have dropped an answer stated first (audit)."""
+    r = (response or "").strip()
+    return r if len(r) <= 40000 else r[:8000] + "\n[... middle omitted ...]\n" + r[-32000:]
+
+
+def judge_prompt(q, response, variant=None):
+    p = JUDGE_PROMPT.format(question=q["question"], gold=q["expected_output"],
+                            reply=render_reply(response))
+    if variant == "swap":
+        head, rest = p.split("REFERENCE ANSWER (authoritative)\n", 1)
+        ref, rest = rest.split("\n\nCANDIDATE REPLY\n", 1)
+        cand, rules = rest.split("\n\nRules:\n", 1)
+        p = (f"{head}CANDIDATE REPLY\n{cand}\n\nREFERENCE ANSWER (authoritative)\n"
+             f"{ref}\n\nRules:\n{rules}")
+    return p
+
+
+def judge_key(prompt, a):
+    """Binds a cached verdict to everything that decided it: the exact prompt
+    (question, reference, rendered reply, rubric), the system prompt, the judge
+    model and effort, and JUDGE_VERSION. Any change re-judges the item."""
+    blob = "\x1f".join((JUDGE_VERSION, a.judge_model, a.judge_effort, JUDGE_SYSTEM, prompt))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:24]
+
+
+def judged_path(ev, model, variant=None):
+    name = f"judged_{variant}.jsonl" if variant else "judged.jsonl"
+    return OUT / ev / slug(model) / name
 
 
 def reply_key(response):
     return hashlib.sha1((response or "").encode("utf-8")).hexdigest()[:16]
 
 
-def load_judged(ev, model):
-    """id -> latest judgment. Each carries the hash of the reply it judged, so a
-    retried question (new reply) is judged again rather than reused."""
-    p = judged_path(ev, model)
+def load_judged(ev, model, variant=None):
+    """id -> latest judgment row; validity is checked by the caller against
+    judge_key(), so stale rows are simply not used."""
+    p = judged_path(ev, model, variant)
     if not p.exists():
         return {}
     out = {}
@@ -1318,6 +1403,13 @@ def load_judged(ev, model):
         j = json.loads(l)
         out[j["id"]] = j
     return out
+
+
+def judge_args(a):
+    """Defaults for callers (score) that did not parse judge flags."""
+    a.judge_model = getattr(a, "judge_model", None) or "opus"
+    a.judge_effort = getattr(a, "judge_effort", None) or "low"
+    return a
 
 
 def cmd_judge(a):
@@ -1331,14 +1423,26 @@ def cmd_judge(a):
     for l in io.open(res, encoding="utf-8"):
         r = json.loads(l)
         last[r["id"]] = r
-    done = load_judged(a.eval, a.model)
-    todo = [r for qid, r in sorted(last.items())
+    pool = [r for qid, r in sorted(last.items())
             if r.get("status") == "ok" and r.get("finish") != "turn_cap"
-            and (a.redo or done.get(qid, {}).get("reply") != reply_key(r.get("response")))]
+            and (r.get("response") or "").strip()]
+    if a.ids:
+        want = set(a.ids.split(","))
+        pool = [r for r in pool if r["id"] in want]
+    if a.variant and a.sample:
+        # the reliability sample is a fixed random subset, the same for both variants
+        pool = random.Random(a.seed).sample(pool, min(a.sample, len(pool)))
+    done = load_judged(a.eval, a.model, a.variant)
+    todo = []
+    for r in pool:
+        p = judge_prompt(by_id[r["id"]], r.get("response"), a.variant)
+        if a.redo or done.get(r["id"], {}).get("key") != judge_key(p, a):
+            todo.append((r, p))
     if a.limit:
         todo = todo[:a.limit]
-    print(f"{a.eval} / {a.model}: {len(todo)} answers to judge with {a.judge_model} "
-          f"({len(last) - len(todo)} already judged or not scorable)")
+    tag = f" [{a.variant}]" if a.variant else ""
+    print(f"{a.eval} / {a.model}{tag}: {len(todo)} answers to judge with {a.judge_model} "
+          f"({len(pool) - len(todo)} of {len(pool)} already judged)")
     if not todo or a.dry_run:
         return 0
     run_model = a.model
@@ -1346,13 +1450,11 @@ def cmd_judge(a):
     judge = JudgeCLI(a)
     a.model = run_model
     lock = threading.Lock()
-    out = judged_path(a.eval, a.model)
+    out = judged_path(a.eval, a.model, a.variant)
     n = collections.Counter()
 
-    def one(rec):
-        q = by_id[rec["id"]]
-        prompt = JUDGE_PROMPT.format(question=q["question"], gold=q["expected_output"],
-                                     reply=(rec.get("response") or "").strip()[-6000:])
+    def one(item):
+        rec, prompt = item
         try:
             txt = judge.chat([{"role": "user", "content": prompt}])["content"]
         except CallError as e:
@@ -1367,20 +1469,124 @@ def cmd_judge(a):
             v, why = m.group(1).upper(), m.group(2).strip()[:200]
         else:  # an unparseable judge reply is never silently a verdict
             v, why = "UNCLEAR", f"judge reply unparseable: {(txt or '')[:80]!r}"
-        row = {"id": rec["id"], "reply": reply_key(rec.get("response")), "verdict": v,
-               "why": why, "judge": a.judge_model, "effort": a.judge_effort}
+        row = {"id": rec["id"], "key": judge_key(prompt, a),
+               "reply": reply_key(rec.get("response")), "verdict": v, "why": why,
+               "judge": a.judge_model, "effort": a.judge_effort,
+               "version": JUDGE_VERSION, "variant": a.variant,
+               "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
         with lock:
             with io.open(out, "a", encoding="utf-8", newline="\n") as fh:
                 fh.write(json.dumps(row, ensure_ascii=False) + "\n")
             n[v] += 1
             k = sum(n.values())
-            if k % 25 == 0 or k == len(todo):
+            if k % 50 == 0 or k == len(todo):
                 print(f"  [{k}/{len(todo)}] {dict(n)}", flush=True)
 
     with cf.ThreadPoolExecutor(a.workers) as ex:
         list(ex.map(one, todo))
     print(f"  -> {out}")
     return 1 if n["ERROR"] else 0
+
+
+def cmd_judge_agree(a):
+    """Agreement of the judge with itself: the main verdicts against a variant
+    run (repeat or order swap) on the same items, as raw agreement and Cohen's
+    kappa over the four labels."""
+    judge_args(a)
+    qs, _ = load_data()
+    by_id = {q["id"]: q for q in qs}
+    last = {}
+    for l in io.open(OUT / a.eval / slug(a.model) / "results.jsonl", encoding="utf-8"):
+        r = json.loads(l)
+        last[r["id"]] = r
+    main, var = load_judged(a.eval, a.model), load_judged(a.eval, a.model, a.variant)
+    pairs = []
+    for qid, v in var.items():
+        r, m = last.get(qid), main.get(qid)
+        if not r or not m:
+            continue
+        if m.get("key") != judge_key(judge_prompt(by_id[qid], r.get("response")), a):
+            continue
+        if v.get("key") != judge_key(judge_prompt(by_id[qid], r.get("response"), a.variant), a):
+            continue
+        pairs.append((m["verdict"], v["verdict"]))
+    if not pairs:
+        print("no comparable pairs")
+        return 1
+    n = len(pairs)
+    po = sum(x == y for x, y in pairs) / n
+    labs = sorted({x for p in pairs for x in p})
+    pe = sum((sum(x == l for x, _ in pairs) / n) * (sum(y == l for _, y in pairs) / n)
+             for l in labs)
+    kappa = (po - pe) / (1 - pe) if pe < 1 else 1.0
+    cc = sum((x == "CORRECT") == (y == "CORRECT") for x, y in pairs) / n
+    print(f"{a.eval} / {a.model} main vs {a.variant}: n={n}  agreement {100 * po:.1f}%  "
+          f"kappa {kappa:.3f}  correct/not-correct agreement {100 * cc:.1f}%")
+    for (x, y), c in sorted(collections.Counter(p for p in pairs if p[0] != p[1]).items()):
+        print(f"    {x} -> {y}: {c}")
+    return 0
+
+
+def cmd_judge_sheet(a):
+    """A blind sheet for a human-vs-judge agreement study: a stratified random
+    sample of judged answers (question, reference, reply), with the judge's and
+    the rule scorer's verdicts in a separate key file so the reader is not
+    anchored. Half the sample comes from items where judge and rules disagree,
+    where an error is most likely; the strata are recorded so agreement can be
+    reweighted to the full run."""
+    judge_args(a)
+    qs, _ = load_data()
+    by_id = {q["id"]: q for q in qs}
+    rng = random.Random(a.seed)
+    items = []
+    for spec in a.runs.split(","):
+        ev, model = spec.split(":", 1)
+        res = OUT / ev / slug(model) / "results.jsonl"
+        rows = score_rows(ev, by_id, [json.loads(l) for l in io.open(res, encoding="utf-8")])
+        jd = load_judged(ev, model)
+        for q, rec, v, _ in rows:
+            j = jd.get(q["id"])
+            if v == "ERROR" or not j:
+                continue
+            if j.get("key") != judge_key(judge_prompt(q, rec.get("response")), a):
+                continue
+            items.append({"run": f"{ev}:{model}", "id": q["id"], "type": q["question_type"],
+                          "question": q["question"], "reference": q["expected_output"],
+                          "reply": (rec.get("response") or "").strip(),
+                          "judge": j["verdict"], "judge_why": j["why"], "rules": v,
+                          "stratum": "disagree" if j["verdict"] != v else "agree"})
+    dis = [i for i in items if i["stratum"] == "disagree"]
+    agr = [i for i in items if i["stratum"] == "agree"]
+    k = a.sample // 2
+    pick = rng.sample(dis, min(k, len(dis)))
+    pick += rng.sample(agr, min(a.sample - len(pick), len(agr)))
+    rng.shuffle(pick)
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    with io.open(out / "sheet.md", "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("# Answer-scoring check\n\nFor each item, decide whether the REPLY states "
+                 "the same answer as the REFERENCE. Treat the reference as correct; do not "
+                 "look anything up. Write one of CORRECT, WRONG, UNKNOWN (the reply "
+                 "declines), UNCLEAR (several answers, none committed) on the Verdict line.\n"
+                 "Every part of a multi-part reference must be right for CORRECT. Numbers, "
+                 "names and times must match; extra correct detail is fine.\n\n")
+        for n_, i in enumerate(pick, 1):
+            fh.write(f"## {n_}. {i['id']}\n\n**Question:** {i['question']}\n\n"
+                     f"**Reference:** {i['reference']}\n\n**Reply:** {i['reply']}\n\n"
+                     f"**Verdict:** \n\n---\n\n")
+    with io.open(out / "key.jsonl", "w", encoding="utf-8", newline="\n") as fh:
+        for n_, i in enumerate(pick, 1):
+            fh.write(json.dumps({"n": n_, **{k_: i[k_] for k_ in
+                                 ("run", "id", "type", "judge", "judge_why", "rules", "stratum")}},
+                                ensure_ascii=False) + "\n")
+    with io.open(out / "strata.json", "w", encoding="utf-8", newline="\n") as fh:
+        json.dump({"pool_disagree": len(dis), "pool_agree": len(agr),
+                   "sampled_disagree": sum(i["stratum"] == "disagree" for i in pick),
+                   "sampled_agree": sum(i["stratum"] == "agree" for i in pick),
+                   "runs": a.runs, "seed": a.seed, "judge_version": JUDGE_VERSION}, fh, indent=1)
+    print(f"{len(pick)} items ({sum(i['stratum'] == 'disagree' for i in pick)} where judge and "
+          f"rules disagree) from a pool of {len(items)} -> {out}")
+    return 0
 
 
 # ---- selftest ---------------------------------------------------------------
@@ -1699,7 +1905,23 @@ def main():
     p.add_argument("--limit", type=int)
     p.add_argument("--redo", action="store_true", help="judge again even if judged")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--ids", help="comma list of question ids")
+    p.add_argument("--variant", choices=VARIANTS,
+                   help="reliability rerun: rep = ask again, swap = candidate before reference")
+    p.add_argument("--sample", type=int, help="with --variant: a fixed random subset of N")
+    p.add_argument("--seed", type=int, default=0)
     p.set_defaults(func=cmd_judge)
+    p = sub.add_parser("judge-agree", help="judge vs its own repeat / order-swap run")
+    p.add_argument("--eval", choices=EVALS, required=True)
+    p.add_argument("--model", required=True)
+    p.add_argument("--variant", choices=VARIANTS, required=True)
+    p.set_defaults(func=cmd_judge_agree)
+    p = sub.add_parser("judge-sheet", help="blind sheet for a human-vs-judge agreement study")
+    p.add_argument("--runs", required=True, help="comma list of eval:model, e.g. zeroshot:haiku")
+    p.add_argument("--sample", type=int, default=100)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--out", required=True)
+    p.set_defaults(func=cmd_judge_sheet)
     sub.add_parser("selftest").set_defaults(func=cmd_selftest)
     a = ap.parse_args()
     return a.func(a)
