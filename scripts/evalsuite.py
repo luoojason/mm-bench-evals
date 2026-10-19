@@ -1208,7 +1208,9 @@ def score_rows(ev, qs_by_id, results, scorer=None):
         last[r["id"]] = r  # a retried question keeps its latest record
     rows = []
     for qid, rec in sorted(last.items()):
-        q = qs_by_id[qid]
+        q = qs_by_id.get(qid)
+        if q is None:
+            continue  # dropped from the release since the run (e.g. a duplicate or a leak)
         if rec["status"] != "ok":
             rows.append((q, rec, "ERROR", rec.get("error", "")))
             continue
@@ -1440,7 +1442,7 @@ def cmd_judge(a):
         last[r["id"]] = r
     pool = [r for qid, r in sorted(last.items())
             if r.get("status") == "ok" and r.get("finish") != "turn_cap"
-            and (r.get("response") or "").strip()]
+            and (r.get("response") or "").strip() and qid in by_id]
     if a.ids:
         want = set(a.ids.split(","))
         pool = [r for r in pool if r["id"] in want]
@@ -1518,7 +1520,7 @@ def cmd_judge_agree(a):
     pairs = []
     for qid, v in var.items():
         r, m = last.get(qid), main.get(qid)
-        if not r or not m:
+        if not r or not m or qid not in by_id:
             continue
         if m.get("key") != judge_key(judge_prompt(by_id[qid], r.get("response")), a):
             continue
