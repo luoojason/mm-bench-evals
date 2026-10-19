@@ -1201,7 +1201,8 @@ def verdict(ev, q, rec):
     return adjudicate(q["expected_output"], first_answer_line(rec["response"]))
 
 
-def score_rows(ev, qs_by_id, results):
+def score_rows(ev, qs_by_id, results, scorer=None):
+    """scorer: "rules" or "judge" (default $EVALSUITE_SCORER, else rules)."""
     last = {}
     for r in results:
         last[r["id"]] = r  # a retried question keeps its latest record
@@ -1218,27 +1219,41 @@ def score_rows(ev, qs_by_id, results):
             continue
         v, why = verdict(ev, q, rec)
         rows.append((q, rec, v, why))
+    if scorer is None:
+        scorer = os.environ.get("EVALSUITE_SCORER", "rules")
+    if scorer == "judge" and ev != "halluc" and rows:
+        rows, _ = apply_judge(ev, rows[0][1].get("model") or "", rows)
     return rows
+
+
+def apply_judge(ev, model, rows):
+    """Replace rule verdicts with valid cached judge verdicts. An answer with no
+    valid judgment keeps its rule verdict, marked "rules (unjudged)", and is
+    counted so a caller can refuse a partly judged run."""
+    a = judge_args(argparse.Namespace())
+    jd = load_judged(ev, model)
+    out, unjudged = [], 0
+    for q, rec, v, why in rows:
+        j = jd.get(q["id"])
+        if v != "ERROR":
+            if j and j.get("key") == judge_key(judge_prompt(q, rec.get("response")), a):
+                v, why = j["verdict"], "judge: " + j["why"]
+            else:
+                unjudged += 1
+                why = "rules (unjudged): " + why
+        out.append((q, rec, v, why))
+    return out, unjudged
 
 
 def cmd_score(a):
     qs, _ = load_data()
     by_id = {q["id"]: q for q in qs}
     res = OUT / a.eval / slug(a.model) / "results.jsonl"
-    rows = score_rows(a.eval, by_id, [json.loads(l) for l in io.open(res, encoding="utf-8")])
+    recs = [json.loads(l) for l in io.open(res, encoding="utf-8")]
+    rows = score_rows(a.eval, by_id, recs, scorer="rules")
     mech = {q["id"]: v for q, _, v, _ in rows}
-    if getattr(a, "judged", False):
-        judge_args(a)
-        jd = load_judged(a.eval, a.model)
-        unjudged = 0
-        for i, (q, rec, v, why) in enumerate(rows):
-            j = jd.get(q["id"])
-            if v == "ERROR" or a.eval == "halluc":
-                continue
-            if j and j.get("key") == judge_key(judge_prompt(q, rec.get("response")), a):
-                rows[i] = (q, rec, j["verdict"], "judge: " + j["why"])
-            else:
-                unjudged += 1
+    if getattr(a, "judged", False) and a.eval != "halluc":
+        rows, unjudged = apply_judge(a.eval, a.model, rows)
         if unjudged:
             print(f"  WARNING: {unjudged} answers have no judgment yet; they keep the "
                   f"rule verdict. Run `judge` first.")
