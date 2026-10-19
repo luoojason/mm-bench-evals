@@ -1202,7 +1202,8 @@ def verdict(ev, q, rec):
 
 
 def score_rows(ev, qs_by_id, results, scorer=None):
-    """scorer: "rules" or "judge" (default $EVALSUITE_SCORER, else rules)."""
+    """scorer: "rules", "judge" or "strict" (the strict-rubric judge; default
+    $EVALSUITE_SCORER, else rules)."""
     last = {}
     for r in results:
         last[r["id"]] = r  # a retried question keeps its latest record
@@ -1223,22 +1224,23 @@ def score_rows(ev, qs_by_id, results, scorer=None):
         rows.append((q, rec, v, why))
     if scorer is None:
         scorer = os.environ.get("EVALSUITE_SCORER", "rules")
-    if scorer == "judge" and ev != "halluc" and rows:
-        rows, _ = apply_judge(ev, rows[0][1].get("model") or "", rows)
+    if scorer in ("judge", "strict") and ev != "halluc" and rows:
+        rows, _ = apply_judge(ev, rows[0][1].get("model") or "", rows,
+                              "strict" if scorer == "strict" else None)
     return rows
 
 
-def apply_judge(ev, model, rows):
+def apply_judge(ev, model, rows, variant=None):
     """Replace rule verdicts with valid cached judge verdicts. An answer with no
     valid judgment keeps its rule verdict, marked "rules (unjudged)", and is
     counted so a caller can refuse a partly judged run."""
     a = judge_args(argparse.Namespace())
-    jd = load_judged(ev, model)
+    jd = load_judged(ev, model, variant)
     out, unjudged = [], 0
     for q, rec, v, why in rows:
         j = jd.get(q["id"])
         if v != "ERROR":
-            if j and j.get("key") == judge_key(judge_prompt(q, rec.get("response")), a):
+            if j and j.get("key") == judge_key(judge_prompt(q, rec.get("response"), variant), a):
                 v, why = j["verdict"], "judge: " + j["why"]
             else:
                 unjudged += 1
@@ -1368,7 +1370,7 @@ JUDGE_VERSION = "2026-10-18.1"
 # A variant reruns the judge on the same items to measure its own reliability:
 # "rep" asks again unchanged (repeat agreement), "swap" shows the candidate
 # before the reference (order sensitivity). Their verdicts never enter scores.
-VARIANTS = ("rep", "swap", "strict")
+VARIANTS = ("rep", "swap", "strict", "strict-rep", "strict-swap")
 
 # "strict" is a sensitivity judge, fixed before seeing its scores: same question,
 # reference and reply, a rubric that gives no benefit of the doubt. It is
@@ -1405,16 +1407,20 @@ def render_reply(response):
 
 
 def judge_prompt(q, response, variant=None):
+    """variant: None (the lenient rubric), "strict", or either with a reliability
+    suffix: "rep"/"strict-rep" ask again unchanged, "swap"/"strict-swap" put the
+    candidate before the reference."""
+    v = variant or ""
     p = JUDGE_PROMPT.format(question=q["question"], gold=q["expected_output"],
                             reply=render_reply(response))
-    if variant == "strict":
+    if v.startswith("strict"):
         p = p.split("\n\nRules:\n", 1)[0] + "\n\n" + STRICT_RULES
-    if variant == "swap":
+    if v.endswith("swap"):
         head, rest = p.split("REFERENCE ANSWER (authoritative)\n", 1)
         ref, rest = rest.split("\n\nCANDIDATE REPLY\n", 1)
-        cand, rules = rest.split("\n\nRules:\n", 1)
+        cand, rules = rest.split("\n\nRules", 1)
         p = (f"{head}CANDIDATE REPLY\n{cand}\n\nREFERENCE ANSWER (authoritative)\n"
-             f"{ref}\n\nRules:\n{rules}")
+             f"{ref}\n\nRules{rules}")
     return p
 
 
@@ -1591,7 +1597,7 @@ def cmd_judge_sheet(a):
             j = jd.get(q["id"])
             if v == "ERROR" or not j:
                 continue
-            if j.get("key") != judge_key(judge_prompt(q, rec.get("response")), a):
+            if j.get("key") != judge_key(judge_prompt(q, rec.get("response"), variant), a):
                 continue
             items.append({"run": f"{ev}:{model}", "id": q["id"], "type": q["question_type"],
                           "question": q["question"], "reference": q["expected_output"],
