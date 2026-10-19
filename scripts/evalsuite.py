@@ -1182,6 +1182,25 @@ def cmd_score(a):
     by_id = {q["id"]: q for q in qs}
     res = OUT / a.eval / slug(a.model) / "results.jsonl"
     rows = score_rows(a.eval, by_id, [json.loads(l) for l in io.open(res, encoding="utf-8")])
+    mech = {q["id"]: v for q, _, v, _ in rows}
+    if getattr(a, "judged", False):
+        jd = load_judged(a.eval, a.model)
+        unjudged = 0
+        for i, (q, rec, v, why) in enumerate(rows):
+            j = jd.get(q["id"])
+            if v == "ERROR" or a.eval == "halluc":
+                continue
+            if j and j["reply"] == reply_key(rec.get("response")):
+                rows[i] = (q, rec, j["verdict"], "judge: " + j["why"])
+            else:
+                unjudged += 1
+        if unjudged:
+            print(f"  WARNING: {unjudged} answers have no judgment yet; they keep the "
+                  f"rule verdict. Run `judge` first.")
+        flips = collections.Counter(f"{mech[q['id']]}->{v}" for q, _, v, _ in rows
+                                    if v != mech[q["id"]])
+        if flips:
+            print("  judge vs rules: " + ", ".join(f"{k} x{n}" for k, n in sorted(flips.items())))
     counts = collections.Counter(v for _, _, v, _ in rows)
     scored = [r for r in rows if r[2] != "ERROR"]
     print(f"{a.eval} / {a.model}: {len(rows)} results, {counts['ERROR']} errors (not scored)")
@@ -1217,12 +1236,151 @@ def cmd_score(a):
     with io.open(out, "w", encoding="utf-8", newline="\n") as fh:
         for q, rec, v, why in rows:
             fh.write(json.dumps({"id": q["id"], "question_type": q["question_type"],
-                                 "verdict": v, "why": why,
+                                 "verdict": v, "why": why, "rule_verdict": mech[q["id"]],
                                  "gold": q["expected_output"],
                                  "answer": first_answer_line(rec.get("response", ""))[:300]},
                                 ensure_ascii=False) + "\n")
     print(f"  -> {out}")
     return 0
+
+
+# ---- LLM judge --------------------------------------------------------------
+#
+# The judge decides every open-book answer; the rule scorer above is kept only as
+# a cross-check, and `score --judged` lists where the two disagree. Rules kept
+# failing in new ways: "eleven-thirty" read as 41 scored a correct "11:30" WRONG,
+# and a number-overlap fix then scored "a year or two" CORRECT against "more than
+# two months" (Claude Haiku pilot and GPT reruns, 2026-10-18). Comparing two
+# answers is a judgment, so a model makes it.
+#
+# The judge never sees the novel: it gets question, reference and reply, and
+# decides whether the reply states the same answer. Holding the book it would
+# start grading the reference, which is the fixed point everything is scored on.
+
+JUDGE_SYSTEM = """You compare a candidate answer with a reference answer to a \
+question about a novel. You do not have the novel and must not judge whether the \
+reference is right: it is authoritative. Decide one thing: does the candidate \
+state the same answer as the reference?"""
+
+JUDGE_PROMPT = """QUESTION
+{question}
+
+REFERENCE ANSWER (authoritative)
+{gold}
+
+CANDIDATE REPLY
+{reply}
+
+Rules:
+- CORRECT: the candidate states the same answer as the reference, in any wording,
+  with or without extra detail. "11:30 p.m." and "eleven-thirty" are the same;
+  "$25" and "twenty-five dollars" are the same.
+- WRONG: the candidate states a different answer (a different number, person,
+  place, time, cause or object), or omits what the question asks for.
+- UNKNOWN: the candidate declines to answer (for example, replies UNKNOWN).
+- UNCLEAR: the candidate offers several answers without committing to one.
+
+Numbers, names and times must match. Extra correct detail is not a defect, and
+neither is extra detail that is merely unverifiable. Missing detail is a defect
+only if the missing part is part of what the question asks for.
+If the reference has several parts (labelled (a), (b) ... or separated by
+semicolons), every part must be answered correctly for CORRECT; one wrong or
+missing part makes it WRONG.
+If the reply reasons at length, judge the answer it finally commits to.
+
+Reply with exactly one line:
+VERDICT: <CORRECT|WRONG|UNKNOWN|UNCLEAR> - <at most 20 words of reason>"""
+
+JUDGE_VERDICT = re.compile(
+    r"VERDICT:\s*\**\s*(CORRECT|WRONG|UNKNOWN|UNCLEAR)\b\**\s*[-–—:]?\s*(.*)", re.I)
+
+
+class JudgeCLI(ClaudeCLI):
+    SYSTEM = JUDGE_SYSTEM
+
+
+def judged_path(ev, model):
+    return OUT / ev / slug(model) / "judged.jsonl"
+
+
+def reply_key(response):
+    return hashlib.sha1((response or "").encode("utf-8")).hexdigest()[:16]
+
+
+def load_judged(ev, model):
+    """id -> latest judgment. Each carries the hash of the reply it judged, so a
+    retried question (new reply) is judged again rather than reused."""
+    p = judged_path(ev, model)
+    if not p.exists():
+        return {}
+    out = {}
+    for l in io.open(p, encoding="utf-8"):
+        j = json.loads(l)
+        out[j["id"]] = j
+    return out
+
+
+def cmd_judge(a):
+    if a.eval == "halluc":
+        print("halluc is scored by abstention, not against a reference; nothing to judge")
+        return 0
+    qs, _ = load_data()
+    by_id = {q["id"]: q for q in qs}
+    res = OUT / a.eval / slug(a.model) / "results.jsonl"
+    last = {}
+    for l in io.open(res, encoding="utf-8"):
+        r = json.loads(l)
+        last[r["id"]] = r
+    done = load_judged(a.eval, a.model)
+    todo = [r for qid, r in sorted(last.items())
+            if r.get("status") == "ok" and r.get("finish") != "turn_cap"
+            and (a.redo or done.get(qid, {}).get("reply") != reply_key(r.get("response")))]
+    if a.limit:
+        todo = todo[:a.limit]
+    print(f"{a.eval} / {a.model}: {len(todo)} answers to judge with {a.judge_model} "
+          f"({len(last) - len(todo)} already judged or not scorable)")
+    if not todo or a.dry_run:
+        return 0
+    run_model = a.model
+    a.model, a.reasoning_effort = a.judge_model, a.judge_effort
+    judge = JudgeCLI(a)
+    a.model = run_model
+    lock = threading.Lock()
+    out = judged_path(a.eval, a.model)
+    n = collections.Counter()
+
+    def one(rec):
+        q = by_id[rec["id"]]
+        prompt = JUDGE_PROMPT.format(question=q["question"], gold=q["expected_output"],
+                                     reply=(rec.get("response") or "").strip()[-6000:])
+        try:
+            txt = judge.chat([{"role": "user", "content": prompt}])["content"]
+        except CallError as e:
+            with lock:
+                n["ERROR"] += 1
+                print(f"  {rec['id']:11} judge error: {str(e)[:120]}", flush=True)
+            return
+        m = None
+        for m in JUDGE_VERDICT.finditer(txt or ""):
+            pass  # the last VERDICT line is the committed one
+        if m:
+            v, why = m.group(1).upper(), m.group(2).strip()[:200]
+        else:  # an unparseable judge reply is never silently a verdict
+            v, why = "UNCLEAR", f"judge reply unparseable: {(txt or '')[:80]!r}"
+        row = {"id": rec["id"], "reply": reply_key(rec.get("response")), "verdict": v,
+               "why": why, "judge": a.judge_model, "effort": a.judge_effort}
+        with lock:
+            with io.open(out, "a", encoding="utf-8", newline="\n") as fh:
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+            n[v] += 1
+            k = sum(n.values())
+            if k % 25 == 0 or k == len(todo):
+                print(f"  [{k}/{len(todo)}] {dict(n)}", flush=True)
+
+    with cf.ThreadPoolExecutor(a.workers) as ex:
+        list(ex.map(one, todo))
+    print(f"  -> {out}")
+    return 1 if n["ERROR"] else 0
 
 
 # ---- selftest ---------------------------------------------------------------
@@ -1526,7 +1684,22 @@ def main():
     p = sub.add_parser("score")
     p.add_argument("--eval", choices=EVALS, required=True)
     p.add_argument("--model", required=True)
+    p.add_argument("--judged", action="store_true",
+                   help="use the LLM judge's verdicts (from `judge`) over the rule scorer's")
     p.set_defaults(func=cmd_score)
+    p = sub.add_parser("judge", help="LLM-judge every answer of a run against its reference")
+    p.add_argument("--eval", choices=EVALS, required=True)
+    p.add_argument("--model", required=True, help="the run to judge, as passed to run")
+    p.add_argument("--judge-model", default="opus",
+                   help="claude -p model alias or id (default opus: not a model under test)")
+    p.add_argument("--judge-effort", default="low", choices=("low", "medium", "high"))
+    p.add_argument("--claude", help="path to the claude executable (default: on PATH)")
+    p.add_argument("--timeout", type=int, default=300)
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--limit", type=int)
+    p.add_argument("--redo", action="store_true", help="judge again even if judged")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=cmd_judge)
     sub.add_parser("selftest").set_defaults(func=cmd_selftest)
     a = ap.parse_args()
     return a.func(a)

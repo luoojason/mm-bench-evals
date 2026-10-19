@@ -88,7 +88,14 @@ def numbers_in(s):
     # so a correct "$25" scored WRONG (gemini-3.8-flash pilot, mcmp-1127).
     total = cur = 0
     run = False
+    prev = ""
     for w in norm(s).split() + [""]:
+        # A tens word straight after a bare unit starts a NEW number:
+        # "eleven-thirty" is the time 11:30, not 41 (Claude Haiku pilot,
+        # retr-1364). With "and" between, it is the old "three-and-twenty", 23.
+        if w in TENS and run and prev != "and" and 0 < cur % 100 < 20:
+            out.add(total + cur)
+            total = cur = 0
         if w in UNITS or w in TENS:
             cur += UNITS.get(w, TENS.get(w))
         elif w in SCALES:
@@ -96,6 +103,7 @@ def numbers_in(s):
             if SCALES[w] >= 1000:
                 total, cur = total + cur, 0
         elif w == "and" and run:
+            prev = w
             continue
         else:
             if run:
@@ -104,6 +112,7 @@ def numbers_in(s):
             run = False
             continue
         run = True
+        prev = w
     return out
 
 
@@ -154,7 +163,12 @@ def adjudicate(gold, response):
         # test case, not in the wild. One number means one candidate answer.
         if len(body) <= 120:
             cand = numbers_in(body)
-            if len(cand) == 1:
+            # ...or exactly the numbers of an all-number gold: "About 11:30
+            # p.m." against "Eleven-thirty". Not when the gold has words of its
+            # own: "(a) A year or two; (b) 179" holds the 2 and 179 of "More
+            # than two months; a hundred and seventy-nine" and is wrong.
+            pure = not [w for w in g.split() if len(w) > 3 and not numbers_in(w)]
+            if len(cand) == 1 or (len(cand) > 1 and cand == gn and pure):
                 stated = cand
         m = None if stated else re.match(
             r"\W*(?:answer\s*[:\-]\s*)?\**\s*"
@@ -170,6 +184,21 @@ def adjudicate(gold, response):
                 cand = numbers_in(m.group(1)[:80])
                 if cand:
                     stated = cand
+        if stated is None and len(g.split()) >= 2:
+            # A worded gold ("Over thirty and under forty", "married secretly
+            # nearly six months ago") is a phrase, not a count, and a reply that
+            # restates the phrase is right however its numbers sit. Only
+            # multi-word golds take this route: a bare "3" would match a list
+            # marker in the working, the comp-1003 failure above. (Claude Haiku
+            # pilot 2026-10-17: 5 of 8 retrieval UNCLEARs were this shape.)
+            gwords = [w for w in g.split() if len(w) > 3]
+            hits = sum(1 for w in gwords
+                       if re.search(r"\b" + re.escape(w) + r"\b", r))
+            # Every gold number must appear too, or "five months" would pass
+            # for "six months" on the words around it.
+            if g in r or (gn <= numbers_in(response) and len(gwords) >= 3
+                          and hits / len(gwords) >= 0.8):
+                return "CORRECT", "worded numeric gold restated in the reply"
         if stated is None:
             return "UNCLEAR", ("numeric gold; the reply does not lead with a "
                                "number, so its stated answer cannot be read "
@@ -384,6 +413,19 @@ def cmd_selftest(a):
         ("Twenty-five dollars", "twenty-five", "CORRECT"),
         ("25", "twenty", "WRONG"),
         ("1250", "one thousand two hundred and fifty", "CORRECT"),
+        # worded numeric golds (Claude Haiku pilot, 2026-10-17)
+        ("Eleven-thirty", 'About 11:30 p.m. ("eleven-thirty")', "CORRECT"),
+        ("Eleven-thirty", "About 11:30 p.m.", "CORRECT"),
+        ("Over thirty and under forty", "Over thirty and under forty", "CORRECT"),
+        ("That he and Lady Stanworth were married secretly nearly six months ago",
+         "They had been secretly married nearly six months; he said Lady "
+         "Stanworth and he were married secretly nearly six months ago.", "CORRECT"),
+        ("That he and Lady Stanworth were married secretly nearly six months ago",
+         "He and Lady Stanworth were married secretly nearly five months ago, "
+         "he says, after some hesitation about it all.", "WRONG"),
+        ("Half-past twelve", "At half past one, he says, after the others left.", "WRONG"),
+        ("More than two months; a hundred and seventy-nine",
+         "(a) A year or two; (b) 179", "UNCLEAR"),
     ]
     ok = fail = 0
     for gold, resp, want in cases:
