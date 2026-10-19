@@ -1368,7 +1368,31 @@ JUDGE_VERSION = "2026-10-18.1"
 # A variant reruns the judge on the same items to measure its own reliability:
 # "rep" asks again unchanged (repeat agreement), "swap" shows the candidate
 # before the reference (order sensitivity). Their verdicts never enter scores.
-VARIANTS = ("rep", "swap")
+VARIANTS = ("rep", "swap", "strict")
+
+# "strict" is a sensitivity judge, fixed before seeing its scores: same question,
+# reference and reply, a rubric that gives no benefit of the doubt. It is
+# reported beside the main judge and never replaces it.
+STRICT_RULES = """Rules (strict):
+- CORRECT only if the candidate gives every element of the reference that the
+  question asks for, each with the same meaning. Rewording is fine; a changed or
+  missing element is not.
+- WRONG if any asked-for element is missing, vaguer than the reference, or
+  different: a qualifier dropped ("a coat" for "his brother's coat"),
+  an approximation for an exact value, a count where the reference names an
+  occasion or vice versa, a related but different person, place, time or cause.
+- WRONG if one part of a multi-part reference (labelled (a), (b) ... or separated
+  by semicolons) is wrong, missing or only partly given.
+- UNKNOWN: the candidate declines to answer (for example, replies UNKNOWN).
+- UNCLEAR: the candidate offers several answers without committing to one.
+
+Numbers, names and times must match exactly. Extra detail is not a defect unless
+it contradicts the reference. If the reply reasons at length, judge the answer
+it finally commits to. If you are unsure whether two answers mean the same
+thing, choose WRONG.
+
+Reply with exactly one line:
+VERDICT: <CORRECT|WRONG|UNKNOWN|UNCLEAR> - <at most 20 words of reason>"""
 
 
 def render_reply(response):
@@ -1383,6 +1407,8 @@ def render_reply(response):
 def judge_prompt(q, response, variant=None):
     p = JUDGE_PROMPT.format(question=q["question"], gold=q["expected_output"],
                             reply=render_reply(response))
+    if variant == "strict":
+        p = p.split("\n\nRules:\n", 1)[0] + "\n\n" + STRICT_RULES
     if variant == "swap":
         head, rest = p.split("REFERENCE ANSWER (authoritative)\n", 1)
         ref, rest = rest.split("\n\nCANDIDATE REPLY\n", 1)
