@@ -43,9 +43,26 @@ Always pilot first (`--limit 5`), check the answers and the cache, then drop `--
 
 ```
 python scripts/evalsuite.py run --eval all --model <provider/model-id> \
-    --reasoning-effort medium --halluc-sample 300 --limit 5
+    --reasoning-effort medium --halluc-sample 300 --limit 5 --max-cost 5
 # --base-url / --key-env for another endpoint; --dry-run prints jobs and token counts
+python scripts/pilot_check.py --model <provider/model-id>   # answers, cache hits, cost
 ```
+
+On OpenRouter:
+- Each request carries a `session_id` derived from its cached block (the book, or the
+  compaction summary), so OpenRouter's sticky routing keeps every call on one book with
+  the provider that holds its cache. Without it OpenRouter keys stickiness on the first
+  user message, which here includes the question, so each question could land on a
+  provider with a cold cache.
+- `--max-cost <dollars>` stops the run once OpenRouter's reported spend reaches it (calls
+  already in flight finish). The spend so far is printed with the progress lines.
+- A bad key (401) or used-up credits or key limit (402) stops the run at once instead of
+  writing an ERROR for every remaining question. Nothing is written for unfinished
+  questions, so rerunning the same command resumes. 429s and OpenRouter's in-flight
+  budget 402 wait for `Retry-After` (capped at 5 min) before retrying.
+- Anthropic's cache lasts 5 minutes from its last read, Gemini's 5 minutes from when it
+  was written. A book's calls run back to back, so Anthropic stays warm; a slow book on
+  Gemini may write its cache twice. `pilot_check.py` shows the misses either way.
 
 **GPT through a ChatGPT / Codex subscription (no API bill):** start the LiteLLM proxy
 (setup, one-time device sign-in and caveats are in the header of
@@ -123,6 +140,7 @@ abstained. ERROR rows are counted but not scored; UNCLEAR verdicts are scored an
 | `scripts/evalsuite.py` | run / score / selftest for the four evals |
 | `scripts/gcheck.py` | the answer adjudicator (`evalsuite` imports it) |
 | `scripts/compile_results.py` | one table across all results |
+| `scripts/pilot_check.py` | after a pilot: errors, empty answers, cache hits, cost |
 | `scripts/prefetch_summaries.py` | parallel compaction summaries |
 | `scripts/download_data.py` | fetch the v4 data from Hugging Face |
 | `scripts/litellm_chatgpt.yaml` | proxy config for the subscription GPT route |

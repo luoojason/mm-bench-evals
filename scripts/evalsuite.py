@@ -54,6 +54,7 @@ import argparse
 import collections
 import concurrent.futures as cf
 import functools
+import hashlib
 import io
 import json
 import os
@@ -197,6 +198,15 @@ class CallError(Exception):
     pass
 
 
+class FatalCallError(CallError):
+    """Stops the whole run instead of failing one question: the next call cannot
+    succeed either (bad key, credits or the key's limit used up, --max-cost reached).
+    Nothing is written for the question, so a later run picks it up."""
+
+
+RETRY_AFTER_CAP = 300  # seconds; never wait longer than this on a server's say-so
+
+
 class OpenAICompat:
     """POST /chat/completions on any OpenAI-compatible endpoint."""
 
@@ -204,6 +214,7 @@ class OpenAICompat:
         import requests
         self.s = requests.Session()
         self.url = a.base_url.rstrip("/") + "/chat/completions"
+        self.openrouter = "openrouter.ai" in self.url
         key = os.environ.get(a.key_env, "") if a.key_env else ""
         self.headers = {"Content-Type": "application/json"}
         if key:
@@ -212,11 +223,15 @@ class OpenAICompat:
         self.extra = json.loads(a.extra) if a.extra else {}
         effort = getattr(a, "reasoning_effort", None)
         if effort:  # OpenRouter takes a reasoning object; OpenAI-style APIs a flat field
-            if "openrouter.ai" in self.url:
+            if self.openrouter:
                 self.extra.setdefault("reasoning", {"effort": effort})
             else:
                 self.extra.setdefault("reasoning_effort", effort)
         self.plain = a.plain_content
+        # Dollars spent so far, from the `cost` OpenRouter puts in every response's
+        # usage. Other endpoints report no cost, so the total stays 0 there.
+        self.max_cost = getattr(a, "max_cost", None)
+        self.spent, self.costed_calls, self._lock = 0.0, 0, threading.Lock()
 
     def _flatten(self, messages):
         if not self.plain:
@@ -229,13 +244,58 @@ class OpenAICompat:
             out.append(m)
         return out
 
+    @staticmethod
+    def session_id(messages):
+        """One OpenRouter session per cached context.
+
+        OpenRouter keeps a model's requests on the provider that already holds the
+        prompt cache ("sticky routing"), but by default it identifies a conversation
+        by hashing the first non-system message. Here that message is book +
+        question, so every question would count as a new conversation and could be
+        routed to a provider with a cold cache. Keying the session on the cached
+        block keeps every call on the same book with the same provider."""
+        for m in messages:
+            c = m.get("content")
+            if isinstance(c, list) and c and "cache_control" in c[0]:
+                return "ctx-" + hashlib.sha1(c[0]["text"].encode("utf-8")).hexdigest()
+        return None
+
+    @staticmethod
+    def _fatal(r):
+        """401 (bad key) and 402 (no credits / key limit) end the run, except a 402
+        for OpenRouter's in-flight budget, which clears after Retry-After."""
+        if r.status_code == 401:
+            return True
+        if r.status_code != 402:
+            return False
+        try:
+            src = ((r.json().get("error") or {}).get("metadata") or {}).get("limit_source")
+        except ValueError:
+            src = None
+        return src != "openrouter_in_flight_budget"
+
+    def _book(self, usage):
+        cost = usage.get("cost")
+        if isinstance(cost, (int, float)):
+            with self._lock:
+                self.spent += cost
+                self.costed_calls += 1
+
     def chat(self, messages, tools=None, max_tokens=None):
+        if self.max_cost is not None and self.spent >= self.max_cost:
+            raise FatalCallError(f"--max-cost ${self.max_cost:.2f} reached "
+                                 f"(spent ${self.spent:.2f})")
         body = {"model": self.model, "messages": self._flatten(messages),
                 "max_tokens": max_tokens or self.max_tokens, **self.extra}
         if tools:
             body["tools"] = tools
+        if self.openrouter and "session_id" not in body:
+            sid = self.session_id(messages)
+            if sid:
+                body["session_id"] = sid
         last = None
         for attempt in range(4):
+            wait = 2 ** attempt * 3
             try:
                 r = self.s.post(self.url, headers=self.headers, json=body,
                                 timeout=self.timeout)
@@ -243,22 +303,35 @@ class OpenAICompat:
                 last = f"{type(e).__name__}: {e}"
             else:
                 if r.status_code == 200:
-                    j = r.json()
+                    try:
+                        j = r.json()
+                    except ValueError:  # cut-off body
+                        j = {"error": f"unreadable body: {r.text[:200]}"}
                     if j.get("error"):
                         last = f"provider error: {str(j['error'])[:300]}"
                     elif not j.get("choices"):
                         last = f"no choices: {str(j)[:300]}"
                     else:
                         msg = j["choices"][0]["message"]
+                        usage = j.get("usage") or {}
+                        self._book(usage)
                         return {"content": msg.get("content") or "",
                                 "tool_calls": msg.get("tool_calls") or [],
                                 "finish": j["choices"][0].get("finish_reason"),
-                                "usage": j.get("usage") or {}}
+                                "usage": usage}
                 else:
                     last = f"HTTP {r.status_code}: {r.text[:300]}"
-                    if r.status_code in (400, 401, 403, 404):
+                    if self._fatal(r):
+                        raise FatalCallError(last)
+                    if r.status_code in (400, 403, 404):
                         break  # not transient
-            time.sleep(2 ** attempt * 3)
+                    try:  # 429 / 503 / in-flight 402 may say how long to wait
+                        wait = max(wait, min(float(r.headers.get("Retry-After")),
+                                             RETRY_AFTER_CAP))
+                    except (TypeError, ValueError):
+                        pass
+            if attempt < 3:
+                time.sleep(wait)
         raise CallError(last)
 
 
@@ -634,8 +707,15 @@ def cmd_run(a, model=None):
                       else OpenAICompat(a))
     wlock = threading.Lock()
     stats = collections.Counter()
+    stop, fatal = threading.Event(), []  # a FatalCallError ends the run
+
+    def spend():
+        n = getattr(model, "costed_calls", 0)
+        return f" ${model.spent:.2f} spent" if n else ""
 
     def one(unit):
+        if stop.is_set():
+            return
         ev, (q, key, _) = unit
         env, res = st[ev]["env"], st[ev]["res"]
         ctx = env["context"](key)
@@ -649,6 +729,13 @@ def cmd_run(a, model=None):
                 raise CallError("no answer within --max-tokens (reasoning used "
                                 "the budget); raise --max-tokens and --retry-errors")
             rec = {"id": q["id"], "status": "ok", **out}
+        except FatalCallError as e:  # nothing written: the question stays to do
+            with wlock:
+                if not stop.is_set():
+                    fatal.append(str(e))
+                    print(f"  STOPPING: {e}", flush=True)
+                stop.set()
+            return
         except Exception as e:  # recorded as infrastructure, never as an answer
             rec = {"id": q["id"], "status": "error",
                    "error": f"{type(e).__name__}: {str(e)[:500]}"}
@@ -661,7 +748,7 @@ def cmd_run(a, model=None):
             n = sum(stats.values())
             if n % 10 == 0 or n <= 5 or n == len(units) or rec["status"] != "ok":
                 tag = rec.get("error", "")[:120]
-                print(f"  [{n}/{len(units)}] {ev} {q['id']} {rec['status']} {tag}",
+                print(f"  [{n}/{len(units)}] {ev} {q['id']} {rec['status']}{spend()} {tag}",
                       flush=True)
 
     # Up to --workers contexts at once, and up to --workers calls in total within them.
@@ -688,7 +775,13 @@ def cmd_run(a, model=None):
                 futs.append(pool.submit(group, us))
         for f in futs:
             f.result()
-    print(f"done: {dict(stats)} -> " + ", ".join(str(st[ev]["res"]) for ev in evs))
+    if fatal:
+        print(f"stopped after {dict(stats)}{spend()}: {fatal[0]}\n"
+              f"Nothing was written for the unfinished questions; rerun the same "
+              f"command to resume once the cause is fixed.")
+        return 3
+    print(f"done: {dict(stats)}{spend()} -> "
+          + ", ".join(str(st[ev]["res"]) for ev in evs))
     return 0 if not stats["error"] else 2
 
 
@@ -1084,6 +1177,93 @@ def cmd_selftest(a):
     check(OpenAICompat(ns("http://localhost:4000/v1")).extra ==
           {"reasoning_effort": "medium"}, "proxy gets reasoning_effort")
 
+    print("OpenRouter client: session per book, stop on key/credit errors, "
+          "Retry-After, --max-cost")
+
+    class Resp:  # a canned HTTP response
+        def __init__(self, code, j=None, headers=None):
+            self.status_code, self._j, self.headers = code, j, headers or {}
+            self.text = json.dumps(j)
+
+        def json(self):
+            return self._j
+
+    class Sess:  # replays canned responses, keeps what was sent
+        def __init__(self, replies):
+            self.replies, self.bodies = list(replies), []
+
+        def post(self, url, headers=None, json=None, timeout=None):
+            self.bodies.append(json)
+            return self.replies.pop(0)
+
+    def ok(cost):
+        return Resp(200, {"choices": [{"message": {"content": "ANSWER: x"},
+                                       "finish_reason": "stop"}],
+                          "usage": {"prompt_tokens": 10, "cost": cost}})
+
+    c = OpenAICompat(ns("https://openrouter.ai/api/v1"))
+    c.s = Sess([ok(0.25), ok(0.25), ok(0.25)])
+    for book, q in [("BOOK ONE", "q1"), ("BOOK ONE", "q2"), ("BOOK TWO", "q1")]:
+        c.chat([cached_user(book, q)])
+    sids = [b.get("session_id") for b in c.s.bodies]
+    check(bool(sids[0]) and sids[0] == sids[1] != sids[2],
+          "one OpenRouter session per book, not per question")
+    check(abs(c.spent - 0.75) < 1e-9, f"reported cost adds up: ${c.spent:.2f}")
+    c.max_cost = 0.75
+    try:
+        c.chat([cached_user("BOOK ONE", "q3")])
+        capped = False
+    except FatalCallError:
+        capped = True
+    check(capped and len(c.s.bodies) == 3, "--max-cost stops before the next call")
+    local = OpenAICompat(ns("http://localhost:4000/v1"))
+    local.s = Sess([ok(0)])
+    local.chat([cached_user("BOOK ONE", "q1")])
+    check("session_id" not in local.s.bodies[0], "no session_id off OpenRouter")
+
+    for code, src in [(401, None), (402, "openrouter_credits"),
+                      (402, "openrouter_key_limit")]:
+        c = OpenAICompat(ns("https://openrouter.ai/api/v1"))
+        c.s = Sess([Resp(code, {"error": {"metadata": {"limit_source": src}}})])
+        try:
+            c.chat([cached_user("B", "q")])
+            got = "returned"
+        except FatalCallError:
+            got = "fatal"
+        except CallError:
+            got = "error"
+        check(got == "fatal" and len(c.s.bodies) == 1,
+              f"HTTP {code} {src or ''} stops the run at once ({got})")
+    slept, real_sleep = [], time.sleep
+    time.sleep = slept.append  # no threads run here
+    try:
+        c = OpenAICompat(ns("https://openrouter.ai/api/v1"))
+        c.s = Sess([Resp(429, {"error": {}}, {"Retry-After": "40"}),
+                    Resp(402, {"error": {"metadata": {
+                        "limit_source": "openrouter_in_flight_budget"}}},
+                         {"Retry-After": "2"}),
+                    ok(0)])
+        c.chat([cached_user("B", "q")])
+    finally:
+        time.sleep = real_sleep
+    check(slept == [40.0, 6], f"429 waits Retry-After, in-flight 402 is retried: {slept}")
+
+    print("a fatal error ends the run and leaves the rest to resume")
+    OUT = tmp / "fatal"
+    n_calls = [0]
+
+    def runs_dry(messages, tools):
+        n_calls[0] += 1
+        if n_calls[0] > 2:
+            raise FatalCallError("HTTP 402: simulated credits used up")
+        return oracle(messages, tools)
+    rc = cmd_run(args("zeroshot", ids=ids, workers=1), model=Fake(runs_dry))
+    rs = results("zeroshot")
+    check(rc == 3 and len(rs) == 2 and all(r["status"] == "ok" for r in rs),
+          f"stopped with {len(rs)} answers written and no ERROR rows (exit {rc})")
+    cmd_run(args("zeroshot", ids=ids), model=Fake(oracle))
+    check(len(results("zeroshot")) == len(ids.split(",")), "rerunning finishes the rest")
+
     shutil.rmtree(tmp, ignore_errors=True)
     print(f"\n{'ALL PASS' if not fails else f'{len(fails)} FAILED'}")
     return 1 if fails else 0
@@ -1130,6 +1310,10 @@ def main():
     p.add_argument("--sample", type=int), p.add_argument("--seed", type=int, default=0)
     p.add_argument("--limit", type=int)
     p.add_argument("--retry-errors", action="store_true")
+    p.add_argument("--max-cost", type=float,
+                   help="stop the run once this many dollars are spent, from the cost "
+                        "OpenRouter reports per call (calls already in flight finish); "
+                        "rerun to resume")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(func=cmd_run)
     p = sub.add_parser("score")
