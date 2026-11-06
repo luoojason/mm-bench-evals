@@ -18,8 +18,10 @@ Agreed settings (2026-10-03): evals a-d, **one generation**, **medium reasoning 
 ## How the run is organised (caching)
 
 - `--eval all` runs every eval for one book together. The first call on a book runs
-  alone and writes the prompt cache; the rest of that book's calls (zeroshot, halluc
-  questions whose distractor is that book) read it. Tools calls carry no book and run last.
+  alone to warm the prompt cache. All `--workers` slots then serve that book's
+  remaining calls across question types and evals, including compaction, before
+  the next book starts. Hallucination questions join the group for their distractor
+  book. Multi-book contexts form separate groups. Tools calls carry no book and run last.
 - The book is sent as its own content block with a cache marker, the question after it,
   so the cached prefix is byte-identical across calls.
 - Compaction summaries are made once per book and shared by its questions.
@@ -109,9 +111,12 @@ Most calls take seconds. The slow part is (b): each book's compaction summary ta
 ~10-15 min on a frontier model at medium effort (~20k-token summaries; the subscription
 route cannot cap their length), and multi-book contexts take longer. The per-call limit
 (`--timeout`) defaults to 1 hour for this reason; at 15 min, two-book summaries failed.
-`run` works on up to `--workers` books at once (each book's first call still goes alone,
-to write the cache). On the subscription route the usage limit, not the script, is
-usually what sets the pace.
+`run` finishes one book context at a time, with up to `--workers` question jobs
+after its first call completes. This prioritizes cache reuse; small groups and
+long compactions can leave workers idle. Provider cache expiry can still cause
+another write. Running the optional summary prefetcher adds separate concurrent
+calls outside this schedule. On the subscription route the usage limit usually
+sets the pace.
 
 ## Checking a pilot
 

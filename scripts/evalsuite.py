@@ -14,9 +14,9 @@ release/build_release.py), so it evaluates exactly what is published.
 
 Any OpenAI-compatible chat endpoint works (OpenRouter, OpenAI, a local
 llama-server or vLLM). Questions run grouped by context, first question of a
-context alone and the rest after it, so every provider that caches prefixes
-writes each book once. Claude and Gemini through OpenRouter need an explicit
-cache breakpoint, which the context block carries.
+context alone and the rest after it, with all workers on that context until it
+finishes, to maximize reads before the cache expires. Claude and Gemini through
+OpenRouter need an explicit cache breakpoint, which the context block carries.
 
 Results go to verify/evalsuite/<eval>/<model>/results.jsonl, one line per
 question, appended as they finish, so a stopped run resumes where it left off.
@@ -32,9 +32,9 @@ answer (the hub's cheat code 17). `score` counts errors separately.
 `--eval all` (or a comma list such as `zeroshot,compact,halluc`) runs the evals
 together, one novel at a time: every eval that puts a given book in context
 (zeroshot, the compaction call, halluc questions that use it as the distractor)
-runs back to back, so the book is written to the cache once and read by all of
-them. Tools calls carry no book and run last. Each eval still writes its own
-results file, so `score` is unchanged.
+runs back to back to reuse the book's prompt cache. Provider expiry can still
+require another cache write. Tools calls carry no book and run last. Each eval
+still writes its own results file, so `score` is unchanged.
 
 GPT through a ChatGPT/Codex subscription: start the LiteLLM proxy
 (scripts/litellm_chatgpt.yaml, notes in its header) and point `run` at it:
@@ -751,30 +751,21 @@ def cmd_run(a, model=None):
                 print(f"  [{n}/{len(units)}] {ev} {q['id']} {rec['status']}{spend()} {tag}",
                       flush=True)
 
-    # Up to --workers contexts at once, and up to --workers calls in total within them.
-    # Within a context the first call still runs alone (it writes the cache) and the
-    # rest follow it. Running contexts one at a time instead left the run serial on
-    # small groups and stalled it behind one slow multi-book summary.
-    calls = threading.BoundedSemaphore(a.workers)
-
-    def gated(unit):
-        with calls:
-            one(unit)
-
-    def group(us):
-        gated(us[0])
-        with cf.ThreadPoolExecutor(max_workers=a.workers) as inner:
-            list(inner.map(gated, us[1:]))
-
+    # Finish one context before warming another. Its first call runs alone;
+    # all workers then serve that context to maximize reads before cache expiry.
     with cf.ThreadPoolExecutor(max_workers=a.workers) as pool:
-        futs = []
+        tools = []
         for key, us in groups.items():
+            if stop.is_set():
+                break
             if isinstance(key, tuple):  # tools: nothing cached, each call on its own
-                futs += [pool.submit(gated, u) for u in us]
+                tools.extend(us)
             else:
-                futs.append(pool.submit(group, us))
-        for f in futs:
-            f.result()
+                one(us[0])
+                if not stop.is_set():
+                    list(pool.map(one, us[1:]))
+        if not stop.is_set():
+            list(pool.map(one, tools))
     if fatal:
         print(f"stopped after {dict(stats)}{spend()}: {fatal[0]}\n"
               f"Nothing was written for the unfinished questions; rerun the same "
@@ -1151,12 +1142,37 @@ def cmd_selftest(a):
     check(len(shared) > 0 and all(first_alone(by_book[stories[b]["text"]]) for b in shared),
           f"{len(shared)} books are both a zeroshot context and a halluc distractor, "
           "and share one first call (cache written once)")
-    firsts = [min(v, key=lambda i: m.spans[i][0]) for v in by_book.values()]
-    check(any(m.spans[i][0] < m.spans[j][1] and m.spans[j][0] < m.spans[i][1]
-              for i in firsts for j in firsts if i != j), "different books run at the same time")
+    by_context = collections.defaultdict(list)
+    for i, c in enumerate(m.calls):
+        cont = c[0]["content"]
+        if isinstance(cont, list):
+            ctx = cont[0]["text"]
+            if ctx.startswith("SUMMARY"):
+                ctx = pack(by_q[q_of(c)]["story_ids"], stories)
+            by_context[ctx].append(i)
+    spans = sorted((min(m.spans[i][0] for i in idx),
+                    max(m.spans[i][1] for i in idx))
+                   for idx in by_context.values())
+    check(all(end <= start for (_, end), (start, _) in zip(spans, spans[1:])),
+          "each context finishes all evals, including summary answers, before the next")
+    def peak_calls(idx):
+        active = peak = 0
+        for _, delta in sorted(event for i in idx for start, end in [m.spans[i]]
+                               for event in ((start, 1), (end, -1))):
+            active += delta
+            peak = max(peak, active)
+        return peak
+
+    peak = peak_calls(range(len(m.calls)))
+    check(peak <= 4 and max(peak_calls(idx) for idx in by_context.values()) == 4,
+          f"one context uses all four workers without exceeding the limit (peak {peak})")
     tool_calls = [c for c in m.calls if c[0]["role"] == "system"]
     check(tool_calls and all(not isinstance(c[1]["content"], list) for c in tool_calls),
           "tools calls carry no book block")
+    tool_starts = [m.spans[i][0] for i, c in enumerate(m.calls)
+                   if c[0]["role"] == "system"]
+    check(tool_starts and min(tool_starts) >= max(end for _, end in spans),
+          "tools start only after every cached context finishes")
     n_sum = sum(1 for c in m.calls if isinstance(c[0]["content"], list)
                 and COMPACT_REQUEST in c[0]["content"][1]["text"])
     check(n_sum == len({r["context"] for r in results("compact")}),
